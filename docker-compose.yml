@@ -1,0 +1,54 @@
+# Local development infrastructure.
+#
+# Start:   docker compose up -d
+# Stop:    docker compose down
+# Reset:   docker compose down -v      (deletes all data)
+#
+# Credentials come from .env, which is git-ignored. Compose reads the
+# unprefixed POSTGRES_* variables; the application reads the APP_* ones and
+# ignores these (extra="ignore" in app/core/config.py).
+
+name: python-ecommerce
+
+services:
+  db:
+    # Pinned to an exact patch version: "18-alpine" is a moving tag and would
+    # silently change the database engine under you on a later pull.
+    image: postgres:18.6-alpine
+    container_name: python-ecommerce-db
+    restart: unless-stopped
+    environment:
+      # Sourced from the APP_DB_* variables so .env holds each credential
+      # exactly once: the application and the container cannot drift apart.
+      # ":?" makes Compose refuse to start if the variable is missing,
+      # rather than silently creating a database with default credentials.
+      POSTGRES_USER: ${APP_DB_USER:?APP_DB_USER is required in .env}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required in .env}
+      POSTGRES_DB: ${APP_DB_NAME:?APP_DB_NAME is required in .env}
+      # Force password hashing to scram-sha-256 rather than relying on the
+      # image default, and require a password even for local socket auth.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    ports:
+      # Bound explicitly to 127.0.0.1: without the host part, Docker publishes
+      # on 0.0.0.0 and the database becomes reachable from the local network.
+      # Host port 5433 because 5432 is held by a native PostgreSQL service.
+      # Same variable the application dials, so the two cannot disagree.
+      - "127.0.0.1:${APP_DB_PORT:-5433}:5432"
+    volumes:
+      # PostgreSQL 18+ images store data in a major-version subdirectory
+      # (/var/lib/postgresql/18/docker) so that pg_upgrade --link works across
+      # versions. Mount the parent, NOT /var/lib/postgresql/data as in 17 and
+      # earlier — that path is ignored in 18 and the container refuses to start.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      # Doubled $$ escapes the variable so it is expanded inside the container,
+      # not by Compose on the host.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  pgdata:
+    name: python-ecommerce-pgdata

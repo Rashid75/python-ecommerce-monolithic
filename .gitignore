@@ -1,0 +1,40 @@
+# ---- Secrets & local configuration -------------------------------
+# NEVER commit real secrets. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+
+# ---- Python ------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+.Python
+
+# ---- Virtual environments ----------------------------------------
+.venv/
+venv/
+env/
+
+# ---- Tooling caches ----------------------------------------------
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- Editors / OS ------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# ---- Runtime artefacts -------------------------------------------
+*.log
+logs/
+postgres-data/

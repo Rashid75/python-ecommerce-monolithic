@@ -1,0 +1,49 @@
+[project]
+name = "python-ecommerce"
+version = "0.1.0"
+description = "Production-oriented ecommerce REST API built with FastAPI, SQLAlchemy 2.0 and PostgreSQL"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.143.1",
+    "psycopg[binary]>=3.3.6",
+    "pydantic-settings>=2.16.0",
+    "sqlalchemy>=2.1.5",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.0",
+]
+
+[tool.uv]
+package = false
+# Project lives on D: while the uv cache is on C:; Windows cannot hardlink
+# across volumes, so copy instead of emitting a warning on every install.
+link-mode = "copy"
+# Use the interpreter installed on this machine (PythonCore 3.12), never a
+# uv-downloaded one. uv's managed builds produced broken launcher shims here.
+python-preference = "only-system"
+python-downloads = "never"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["app"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes (undefined names, unused imports)
+    "I",   # isort (import ordering)
+    "B",   # flake8-bugbear (likely bugs)
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade (modern syntax for target-version)
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific rules
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
