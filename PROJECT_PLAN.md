@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 8 — Sessions, transactions & lifecycle explanation** (Steps 1–7 complete) |
+| **Current step** | **Step 10 — First model and migration** (Steps 1–9 complete) |
 | **Phases complete** | 1 of 12 |
-| **Steps complete** | 7 of 74 |
+| **Steps complete** | 9 of 74 |
 
 ### Goals
 
@@ -172,9 +172,9 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 5 | PostgreSQL locally via Docker Compose | ✅ |
 | 6 | Database connection configuration, PostgreSQL driver | ✅ |
 | 7 | Engine, session factory, declarative base, DB dependency | ✅ |
-| 8 | Explain sessions, connections, transactions, lifecycle, cleanup | 🔵 |
-| 9 | Configure Alembic | ⬜ |
-| 10 | First model and migration; apply and inspect | ⬜ |
+| 8 | Explain sessions, connections, transactions, lifecycle, cleanup | ✅ |
+| 9 | Configure Alembic | ✅ |
+| 10 | First model and migration; apply and inspect | 🔵 |
 | 11 | Explain why `create_all()` must not replace migrations in production | ⬜ |
 
 ### Phase 3 — Product Module
@@ -1145,9 +1145,89 @@ advanced patterns only when a concrete problem calls for them.
 
 ---
 
-### 🔵 Step 8 — Sessions, Connections, Transactions & Lifecycle *(current)*
+### ✅ Step 8 — Sessions, Connections, Transactions & Lifecycle
 
-Not started. Explanation step — no new code expected.
+**Completed:** 2026-10-20 · Explanation step — **no code added**.
+
+Demonstrated live against the running database with a throwaway script.
+
+**The connection pool is lazy and self-returning:**
+
+```
+connections in use at start : 0
+after creating a Session    : 0   (still none - it is lazy)
+after running a query       : 1   (borrowed one)
+after close()               : 0   (given back to the pool)
+```
+
+Creating a `Session` costs nothing. A connection is borrowed on the first query and returned
+by `close()` — which is why the `finally: db.close()` in `get_db` matters: skip it and the
+pool leaks until it is exhausted and every request hangs.
+
+**Transactions:**
+
+| Action | Result observed |
+|---|---|
+| INSERT, then `rollback()` | `[]` — work discarded |
+| INSERT, then `commit()` | `['from commit']` — permanent |
+| INSERT, then `close()` with no commit | `['from commit']` — the new row vanished |
+
+The last line is the important one: **closing without committing discards the work**. This
+is why `get_db` needs no explicit `rollback()`, and why a service that forgets `commit()`
+silently loses data rather than erroring.
+
+Also shown: uncommitted work is invisible to other sessions (isolation) — the `[]` before
+`rollback()` was read by a second session while the first still held the row in its
+transaction.
+
+**Where this lands in the architecture:** `get_db` owns the session's *lifetime*; the
+service layer owns *transaction boundaries* and calls `commit()`. Relevant to Step 47, where
+checkout must write an order, its items and a stock decrement as one unit.
+
+---
+
+### ✅ Step 9 — Configure Alembic
+
+**Completed:** 2026-10-21 · Alembic 1.20.0
+
+`uv run alembic init alembic` generated `alembic.ini`, `alembic/env.py`,
+`alembic/script.py.mako` and `alembic/versions/`. Three edits were made to the generated
+files; everything else was left as produced.
+
+| Edit | Why |
+|---|---|
+| `alembic.ini`: removed `sqlalchemy.url = driver://user:pass@...` | `alembic.ini` **is committed to git**. A URL here would commit the database password. |
+| `alembic/env.py`: URL read from `get_settings().database_url` | One source of credentials — the same `.env` the app and Compose already use. |
+| `alembic/env.py`: `target_metadata = Base.metadata` | Lets `--autogenerate` compare the models against the live database. Without it autogenerate produces empty migrations. |
+
+Also enabled `file_template` in `alembic.ini` so migration files are named
+`2026_10_21_1430-ab12cd34_create_products.py` and the `versions/` folder reads in date order
+instead of by random revision id.
+
+`run_migrations_online()` was simplified to use `create_engine(...)` directly rather than
+`engine_from_config(...)`, since the URL no longer comes from the ini file. It uses
+`NullPool` — a migration command is short-lived, so connection pooling gains nothing.
+
+#### Verification
+
+| Check | Result |
+|---|---|
+| `uv run alembic current` | `Context impl PostgresqlImpl` — connected successfully |
+| `uv run alembic heads` | Empty — no migrations exist yet, as expected |
+| `public` tables | None — `alembic_version` is created on the first `upgrade` |
+| Password present in `alembic.ini` or `env.py` | **No** — searched explicitly |
+| `ruff check` | Clean (one import-order fix applied) |
+
+#### Risk & Controls Note
+
+The one control that matters here: **no database credential in a committed file**. Alembic's
+generated `alembic.ini` ships a `sqlalchemy.url` placeholder that invites exactly that
+mistake; it was removed and the URL moved into `env.py`, which reads the git-ignored `.env`.
+Verified by searching both committed files for the password. Offline mode
+(`alembic upgrade --sql`) is available for environments where a DBA reviews SQL before it
+runs — relevant to Step 70. **Residual risk: Low.**
+
+---
 
 ---
 
