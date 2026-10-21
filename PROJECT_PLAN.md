@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 11 — Why migrations, not create_all()** (Steps 1–10 complete) |
-| **Phases complete** | 1 of 12 |
-| **Steps complete** | 10 of 74 |
+| **Current step** | **Step 13 — Pydantic schemas for products** (Steps 1–12 complete) |
+| **Phases complete** | 2 of 12 |
+| **Steps complete** | 12 of 74 |
 
 ### Goals
 
@@ -175,14 +175,14 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 8 | Explain sessions, connections, transactions, lifecycle, cleanup | ✅ |
 | 9 | Configure Alembic | ✅ |
 | 10 | First model and migration; apply and inspect | ✅ |
-| 11 | Explain why `create_all()` must not replace migrations in production | 🔵 |
+| 11 | Explain why `create_all()` must not replace migrations in production | ✅ |
 
 ### Phase 3 — Product Module
 
 | # | Step | Status |
 |---|---|---|
-| 12 | Design product table and constraints | ⬜ |
-| 13 | Pydantic request/response schemas | ⬜ |
+| 12 | Design product table and constraints | ✅ |
+| 13 | Pydantic request/response schemas | 🔵 |
 | 14 | Product repository | ⬜ |
 | 15 | Product service and business rules | ⬜ |
 | 16 | FastAPI routes with dependency injection | ⬜ |
@@ -1298,6 +1298,98 @@ any model existed.
 - **Deferred:** backup-before-migrate and a forward-only migration policy for production
   (Step 70); `id` is a sequential integer — fine internally, but predictable if ever exposed
   in a public URL, reviewed at Step 65.
+- **Residual risk: Low.**
+
+---
+
+### ✅ Step 11 — Why `create_all()` Must Not Replace Migrations
+
+**Completed:** 2026-10-21 · Explanation step — **no code added**. Phase 2 complete.
+
+Demonstrated with throwaway in-memory SQLite (nothing real touched): a table was created
+with two columns, a third column was added to the model, and `create_all()` was called again.
+
+```
+after first create_all() : ['id', 'name']
+after second create_all(): ['id', 'name']
+```
+
+**`create_all()` creates missing tables. It never alters an existing one — and it reports no
+error when it skips.** The application then fails at runtime with
+`column "price" does not exist`, far from the cause.
+
+What it cannot do at all: rename a column without data loss, add a `NOT NULL` column with a
+backfill, change a type with a `USING` clause, add a constraint after cleaning violating
+rows, or reverse any of it. Every one of those is ordinary production work.
+
+It also has no record of what has been applied — no `alembic_version` equivalent — so there
+is no way to tell which environment is at which schema, and no rollback path.
+
+**This is the SQLAlchemy equivalent of `synchronize: false` in NestJS/TypeORM.** The project
+uses Alembic exclusively; `create_all()` appears nowhere in the codebase and should not be
+added, including "just for tests" — a test suite that builds its schema differently from
+production stops testing production's schema.
+
+Deferred: backup-before-migrate and forward-only production policy (Step 70).
+
+---
+
+### ✅ Step 12 — Product Table Design
+
+**Completed:** 2026-10-21 · Phase 3 begins.
+
+`app/modules/products/models.py`:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER` PK | |
+| `sku` | `VARCHAR(50)` unique | Unique also creates an index, so lookups by SKU are fast |
+| `name` | `VARCHAR(200)` | |
+| `description` | `TEXT` nullable | `str \| None` makes it nullable |
+| `price` | `NUMERIC(12,2)` | **Never `Float`** — see below |
+| `is_active` | `BOOLEAN` default `true` | Hide a product without deleting it, so past orders stay meaningful |
+| `created_at` / `updated_at` | `TIMESTAMPTZ` default `now()` | `updated_at` also uses `onupdate` |
+
+**Money uses `Numeric`, not `Float`.** Demonstrated: `0.1 + 0.2` is `0.30000000000000004` in
+floating point but exactly `0.3` as `Decimal`. Those errors compound across order totals,
+tax and refunds, and produce reconciliation failures that are very hard to trace. SQLAlchemy
+returns `Numeric` columns to Python as `Decimal`.
+
+**Database-level constraints** (verified present on the model):
+
+```
+ck_products_price_not_negative     CheckConstraint
+pk_products                        PrimaryKeyConstraint
+uq_products_sku                    UniqueConstraint
+```
+
+The check constraint means PostgreSQL refuses a negative price even if application code
+somehow permits one — a safety net beneath the service layer, consistent with the Step 10
+decision to enforce integrity in the database as well as in code.
+
+**Deliberately excluded for now:** `category_id` (Step 21 adds the relationship via its own
+migration), stock quantity (Phase 6 — inventory is its own concern with its own concurrency
+rules), and currency (single-currency for now; multi-currency would need an explicit
+currency column beside every monetary amount).
+
+**Tooling change:** `extend-exclude = ["alembic/versions"]` added to the Ruff config.
+Generated migration files are a historical record and should not be reformatted; Ruff was
+otherwise flagging Alembic's own generated style.
+
+**Migration:** generated and applied by the user, not by the assistant (see
+[[user-runs-db-commands]] working agreement).
+
+#### Risk & Controls Note
+
+- **Data:** no data; schema definition only.
+- **Controls:** exact decimal arithmetic for monetary values — a correctness and audit
+  requirement for financial records, not a preference; a database-level check constraint on
+  price; unique SKU enforced by the database; `is_active` enables soft withdrawal so order
+  history remains intact rather than being destroyed by a delete; `timestamptz` from the
+  database clock for audit trails.
+- **Deferred:** currency handling if the shop ever becomes multi-currency; `id` is a
+  sequential integer and predictable if exposed publicly (Step 65); price-change history is
+  not retained — order items will snapshot the price at purchase time (Step 46).
 - **Residual risk: Low.**
 
 ---

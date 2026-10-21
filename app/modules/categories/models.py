@@ -23,6 +23,4 @@ class Category(Base):
 
     # server_default=func.now() means PostgreSQL fills this in on INSERT.
     # timezone=True stores the offset, so times stay correct across regions.
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

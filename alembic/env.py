@@ -13,12 +13,13 @@ from logging.config import fileConfig
 from alembic import context
 from app.core.config import get_settings
 from app.db.base import Base
-from sqlalchemy import create_engine, pool
 
 # Importing a model module registers its table on Base.metadata.
 # EVERY new model must be added here, or autogenerate will not see it and
 # will quietly produce an empty migration.
 from app.modules.categories.models import Category  # noqa: F401
+from app.modules.products.models import Product  # noqa: F401
+from sqlalchemy import create_engine, pool
 
 config = context.config
 
