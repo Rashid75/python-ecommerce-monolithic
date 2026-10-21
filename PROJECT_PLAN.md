@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 10 — First model and migration** (Steps 1–9 complete) |
+| **Current step** | **Step 11 — Why migrations, not create_all()** (Steps 1–10 complete) |
 | **Phases complete** | 1 of 12 |
-| **Steps complete** | 9 of 74 |
+| **Steps complete** | 10 of 74 |
 
 ### Goals
 
@@ -174,8 +174,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 7 | Engine, session factory, declarative base, DB dependency | ✅ |
 | 8 | Explain sessions, connections, transactions, lifecycle, cleanup | ✅ |
 | 9 | Configure Alembic | ✅ |
-| 10 | First model and migration; apply and inspect | 🔵 |
-| 11 | Explain why `create_all()` must not replace migrations in production | ⬜ |
+| 10 | First model and migration; apply and inspect | ✅ |
+| 11 | Explain why `create_all()` must not replace migrations in production | 🔵 |
 
 ### Phase 3 — Product Module
 
@@ -1228,6 +1228,77 @@ Verified by searching both committed files for the password. Offline mode
 runs — relevant to Step 70. **Residual risk: Low.**
 
 ---
+
+### ✅ Step 10 — First Model and Migration
+
+**Completed:** 2026-10-21
+
+#### What was built
+
+`app/modules/categories/models.py` — a deliberately small first model: `id`, `name`
+(`VARCHAR(100)`, unique), `created_at` (`timestamptz`, `server_default=now()`).
+
+**Category rather than Product**, because Product needs prices, SKUs and several constraints
+that Step 12 designs properly. Category is the simplest real table in the system, is needed
+regardless (Step 20), and keeps this step about migration mechanics rather than schema design.
+
+| File | |
+|---|---|
+| `app/modules/__init__.py`, `app/modules/categories/__init__.py` | new |
+| `app/modules/categories/models.py` | new — the `Category` model |
+| `alembic/env.py` | imports `Category` so autogenerate can see it |
+| `alembic/versions/2026_10_21_1438-050533dc4a24_create_categories_table.py` | generated |
+
+#### The naming convention paid off
+
+The generated migration contains explicit constraint names rather than PostgreSQL's invented
+ones:
+
+```python
+sa.PrimaryKeyConstraint('id', name=op.f('pk_categories')),
+sa.UniqueConstraint('name', name=op.f('uq_categories_name'))
+```
+
+This is why `downgrade()` is reliable, and why the convention had to be set in Step 7 before
+any model existed.
+
+#### Verification
+
+| Check | Result |
+|---|---|
+| `alembic revision --autogenerate` | `Detected added table 'categories'` |
+| Generated migration reviewed before running | Correct — named constraints, matching types |
+| `alembic upgrade head` | Applied |
+| `\d categories` | `pk_categories` PRIMARY KEY, `uq_categories_name` UNIQUE, `created_at` default `now()` |
+| INSERT `'Books'` | `1\|Books\|2026-10-21 09:38:32.68561+00` — server filled `created_at` |
+| INSERT `'Books'` again | **Rejected**: `duplicate key value violates unique constraint "uq_categories_name"` |
+| `alembic current` | `050533dc4a24 (head)` |
+| `alembic downgrade -1` | Table dropped; only `alembic_version` remained |
+| `alembic upgrade head` again | Table recreated; `count = 0` — downgrade took the data with it |
+| `ruff check app` | Clean |
+
+#### Points recorded
+
+1. **A model Alembic never imports does not exist to it.** `env.py` must import every model
+   module or autogenerate silently emits an empty migration. The most common Alembic mistake.
+2. **Generated migrations are a draft.** Alembic itself writes `please adjust!` in the output.
+   Read every one before running it.
+3. **`downgrade()` destroys data.** Dropping the table took the `Books` row with it. Fine in
+   development; in production a downgrade is a data-loss event, which is why Step 70 covers
+   backup-before-migrate.
+
+#### Risk & Controls Note
+
+- **Data:** synthetic test row only, removed by the downgrade test.
+- **Controls:** the unique constraint is enforced **by the database**, not only by application
+  code — the integrity safeguard that still holds when a bug, a background job or a manual
+  query bypasses the service layer. `created_at` uses `timestamptz` with a server default, so
+  the timestamp comes from the database clock rather than an application server's, which
+  matters for audit trails across regions.
+- **Deferred:** backup-before-migrate and a forward-only migration policy for production
+  (Step 70); `id` is a sequential integer — fine internally, but predictable if ever exposed
+  in a public URL, reviewed at Step 65.
+- **Residual risk: Low.**
 
 ---
 

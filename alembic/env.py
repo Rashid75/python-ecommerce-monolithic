@@ -16,8 +16,9 @@ from app.db.base import Base
 from sqlalchemy import create_engine, pool
 
 # Importing a model module registers its table on Base.metadata.
-# Every new model must be imported here, or autogenerate will not see it.
-# (No models exist yet - the first one arrives in Step 10.)
+# EVERY new model must be added here, or autogenerate will not see it and
+# will quietly produce an empty migration.
+from app.modules.categories.models import Category  # noqa: F401
 
 config = context.config
 
