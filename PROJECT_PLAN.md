@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 14 — Product repository** (Steps 1–13 complete) |
+| **Current step** | **Step 15 — Product service and business rules** (Steps 1–14 complete) |
 | **Phases complete** | 2 of 12 |
-| **Steps complete** | 13 of 74 |
+| **Steps complete** | 14 of 74 |
 
 ### Goals
 
@@ -183,8 +183,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 |---|---|---|
 | 12 | Design product table and constraints | ✅ |
 | 13 | Pydantic request/response schemas | ✅ |
-| 14 | Product repository | 🔵 |
-| 15 | Product service and business rules | ⬜ |
+| 14 | Product repository | ✅ |
+| 15 | Product service and business rules | 🔵 |
 | 16 | FastAPI routes with dependency injection | ⬜ |
 | 17 | Create, list, get-by-ID, update, delete endpoints | ⬜ |
 | 18 | Pagination, filtering, sorting, search, validation | ⬜ |
@@ -1442,6 +1442,71 @@ defence for anything that reaches the database another way. Neither replaces the
 - **Deferred:** rejecting unknown fields in request bodies (`extra="forbid"`) — worth a
   decision at Step 65; authorisation, so that only administrators may create or update
   products (Step 30).
+- **Residual risk: Low.**
+
+---
+
+### ✅ Step 14 — Product Repository
+
+**Completed:** 2026-10-21
+
+`app/modules/products/repository.py` — plain functions, each taking the `Session` as its
+first argument.
+
+| Function | |
+|---|---|
+| `get_by_id` | `db.get()` — primary-key lookup, checks the session before querying |
+| `get_by_sku` | `select().where()` |
+| `list_products` | `limit`/`offset` always applied |
+| `add` | `db.add()` + `db.flush()` to obtain the generated id |
+| `remove` | `db.delete()` |
+
+#### Decisions
+
+**Functions, not a class.** There is no state to hold between calls, so a class with
+`__init__(self, db)` would add instantiation boilerplate and nothing else.
+
+**No `update()` function.** SQLAlchemy tracks changes to an object loaded in a session, so
+the service assigns new values and the UPDATE is emitted on the next flush. Verified: setting
+`created.name` and calling `flush()` produced the new value with no repository call.
+
+**`flush()`, never `commit()`.** The repository stages work; the service decides whether the
+whole unit of work succeeds. This keeps the Step 7 split intact — `get_db` owns the session's
+lifetime, the service owns the transaction.
+
+**`limit`/`offset` from the start**, defaulting to 20. An unbounded query works on ten rows
+and takes the server down on ten million. Step 18 adds filtering, sorting and search on top.
+
+#### Verification — run against the real database, then rolled back
+
+| Check | Result |
+|---|---|
+| `add()` then `flush()` | id `1` assigned by PostgreSQL; `created_at` set by the server |
+| `get_by_id(1)` / `get_by_sku('BOOK-001')` | both returned `Clean Code` |
+| `get_by_id(99999)` / `get_by_sku('NOPE')` | both `None` — no exception |
+| Assign `name` + `flush()` | `Clean Code (2nd ed)` — dirty tracking confirmed |
+| `list_products(limit=2, offset=0)` | `['BOOK-001', 'BOOK-002']` |
+| `list_products(limit=2, offset=2)` | `['BOOK-003']` |
+| `ProductRead.model_validate(model)` | correct JSON, price as `"29.99"` |
+| `remove()` + `flush()` | `get_by_id` returned `None` |
+| **After `rollback()`** | **0 products — database unchanged** |
+
+The final line matters: the whole exercise ran inside one transaction and was rolled back,
+which is the same mechanism that will make checkout atomic in Step 47.
+
+#### Risk & Controls Note
+
+- **Data:** synthetic rows only, never committed.
+- **Controls:** every query is built with SQLAlchemy's `select()` and bound parameters, so
+  values are sent to PostgreSQL separately from the SQL text — no string interpolation
+  anywhere, closing the injection path by construction. `list_products` always applies a
+  limit, preventing an unbounded result set being used as a denial-of-service vector or
+  exhausting memory. Returning `None` rather than raising for a missing row keeps "not
+  found" a normal outcome for the service to handle, rather than an exception that could
+  surface internals to a client.
+- **Deferred:** filtering, sorting and search (Step 18); keyset pagination if `offset` on
+  large tables becomes slow (Step 64); soft-delete policy — `remove()` currently deletes the
+  row, which Step 51 should revisit once orders reference products.
 - **Residual risk: Low.**
 
 ---
