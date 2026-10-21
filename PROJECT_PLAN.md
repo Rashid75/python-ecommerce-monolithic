@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 13 — Pydantic schemas for products** (Steps 1–12 complete) |
+| **Current step** | **Step 14 — Product repository** (Steps 1–13 complete) |
 | **Phases complete** | 2 of 12 |
-| **Steps complete** | 12 of 74 |
+| **Steps complete** | 13 of 74 |
 
 ### Goals
 
@@ -182,8 +182,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | # | Step | Status |
 |---|---|---|
 | 12 | Design product table and constraints | ✅ |
-| 13 | Pydantic request/response schemas | 🔵 |
-| 14 | Product repository | ⬜ |
+| 13 | Pydantic request/response schemas | ✅ |
+| 14 | Product repository | 🔵 |
 | 15 | Product service and business rules | ⬜ |
 | 16 | FastAPI routes with dependency injection | ⬜ |
 | 17 | Create, list, get-by-ID, update, delete endpoints | ⬜ |
@@ -1390,6 +1390,58 @@ otherwise flagging Alembic's own generated style.
 - **Deferred:** currency handling if the shop ever becomes multi-currency; `id` is a
   sequential integer and predictable if exposed publicly (Step 65); price-change history is
   not retained — order items will snapshot the price at purchase time (Step 46).
+- **Residual risk: Low.**
+
+---
+
+### ✅ Step 13 — Product Pydantic Schemas
+
+**Completed:** 2026-10-21
+
+`app/modules/products/schemas.py` — three schemas, kept separate from the ORM model because
+the database row and the API contract change for different reasons.
+
+| Schema | Purpose |
+|---|---|
+| `ProductCreate` | POST body. All required fields present, validated. |
+| `ProductUpdate` | PATCH body. Every field optional. **`sku` deliberately absent** — it identifies the product for the business, so changing it would silently break invoices, reports and integrations. |
+| `ProductRead` | Response. `ConfigDict(from_attributes=True)` lets Pydantic build it straight from a SQLAlchemy object. |
+
+#### Verification (read-only, no database)
+
+| Input | Result |
+|---|---|
+| Valid product | accepted |
+| `price = -1` | rejected — `Input should be greater than or equal to 0` |
+| `price = 9.999` | rejected — `Decimal input should have no more than 2 decimal places` |
+| `sku = ""` | rejected — `String should have at least 1 character` |
+| `name` over 200 chars | rejected — `String should have at most 200 characters` |
+| `price` missing | rejected — `Field required` |
+| Parsed price type | `Decimal`, value `29.99` — not float |
+| `ProductUpdate(price=...)` with `exclude_unset=True` | `{'price': Decimal('19.99')}` only |
+| `ProductRead.model_validate(orm_object)` | `{"id":1,"sku":"BOOK-001",...,"price":"29.99",...}` |
+
+Note `price` serialises to JSON as the **string** `"29.99"`, not a number. That is correct
+and deliberate: JSON numbers are IEEE floats, so emitting `29.99` as a number would reintroduce
+the precision problem at the API boundary. Clients should parse it as a decimal type.
+
+#### Two layers of validation, on purpose
+
+`decimal_places=2` and `ge=0` in the schema give the client a clear 422 at the API boundary.
+The `ck_products_price_not_negative` check constraint from Step 12 remains as the last line of
+defence for anything that reaches the database another way. Neither replaces the other.
+
+#### Risk & Controls Note
+
+- **Controls:** input validated at the API boundary before it reaches business logic or the
+  database — bounded string lengths prevent oversized payloads being stored, and
+  `decimal_places=2` prevents silent rounding of monetary values. `ProductRead` is an
+  allow-list: only the fields named there are ever serialised, so a column added to the model
+  later cannot leak into a response by accident. That same mechanism protects the password
+  hash at Step 25.
+- **Deferred:** rejecting unknown fields in request bodies (`extra="forbid"`) — worth a
+  decision at Step 65; authorisation, so that only administrators may create or update
+  products (Step 30).
 - **Residual risk: Low.**
 
 ---
