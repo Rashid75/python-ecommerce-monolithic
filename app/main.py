@@ -7,6 +7,7 @@ Run with:
 from fastapi import FastAPI
 
 from app.api.health import router as health_router
+from app.api.router import api_router
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -25,4 +26,9 @@ app = FastAPI(
     openapi_url=openapi,
 )
 
+# Health probes stay at the root, outside the version prefix: infrastructure
+# should not have to change when the API version does.
 app.include_router(health_router)
+
+# Everything else lives under /api/v1.
+app.include_router(api_router, prefix=settings.api_v1_prefix)

@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 16 — FastAPI routes with dependency injection** (Steps 1–15 complete) |
+| **Current step** | **Step 17 — Create, update and delete endpoints** (Steps 1–16 complete) |
 | **Phases complete** | 2 of 12 |
-| **Steps complete** | 15 of 74 |
+| **Steps complete** | 16 of 74 |
 
 ### Goals
 
@@ -185,8 +185,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 13 | Pydantic request/response schemas | ✅ |
 | 14 | Product repository | ✅ |
 | 15 | Product service and business rules | ✅ |
-| 16 | FastAPI routes with dependency injection | 🔵 |
-| 17 | Create, list, get-by-ID, update, delete endpoints | ⬜ |
+| 16 | FastAPI routes with dependency injection | ✅ |
+| 17 | Create, list, get-by-ID, update, delete endpoints | 🔵 |
 | 18 | Pagination, filtering, sorting, search, validation | ⬜ |
 | 19 | Explain full request lifecycle with a real product request | ⬜ |
 
@@ -1583,6 +1583,71 @@ session, rather than it merely looking right inside one.
   distinguishing which unique constraint an `IntegrityError` came from, once products has
   more than one.
 - **Residual risk: Low.**
+
+---
+
+### ✅ Step 16 — Product Routes and Dependency Injection
+
+**Completed:** 2026-10-22 · Read endpoints only; writes follow in Step 17.
+
+| File | |
+|---|---|
+| `app/modules/products/router.py` | **new** — `GET /products`, `GET /products/{id}` |
+| `app/api/router.py` | **new** — aggregates module routers |
+| `app/main.py` | mounts `api_router` under `settings.api_v1_prefix` |
+
+#### Decisions
+
+**An aggregate router in `app/api/router.py`.** `main.py` mounts it once, so adding a module
+later is one line there rather than another change to the application entry point.
+
+**The version prefix is applied at mount time**, not written into each module's router. The
+module declares `prefix="/products"`; `main.py` supplies `/api/v1`. A v2 becomes a mounting
+change, not an edit to every router.
+
+**Health probes stay at the root**, outside the version prefix — infrastructure should not
+need reconfiguring when the API version changes.
+
+**`db: DbSession` as the only dependency so far.** The `Annotated[Session, Depends(get_db)]`
+alias from Step 7 keeps the signature readable. FastAPI opens the session, passes it in, and
+closes it when the response is sent.
+
+**Errors are mapped in the route for now.** `NotFoundError` → 404 via `HTTPException`. Step
+59 replaces this with one handler for every endpoint; until then the mapping is explicit and
+visible.
+
+#### Verification — live server
+
+| Request | Response |
+|---|---|
+| Routes in the OpenAPI document | `/health`, `/health/ready`, `/api/v1/products`, `/api/v1/products/{product_id}` |
+| `GET /api/v1/products` | `[]` · **200** |
+| `GET /api/v1/products/999` | `{"detail":"Product 999 does not exist"}` · **404** |
+| `GET /api/v1/products/abc` | `int_parsing` error · **422** |
+| `GET /api/v1/products?limit=500` | `Input should be less than or equal to 100` · **422** |
+
+The last two never reached application code — FastAPI rejected them from the type annotation
+and the `Query` bounds alone.
+
+#### Tooling
+
+Ruff began reformatting Python samples inside `PROJECT_PLAN.md`; `*.md` added to
+`extend-exclude` alongside `alembic/versions`.
+
+#### Risk & Controls Note
+
+- **Controls:** `limit` is bounded at 100 by `Query(le=100)`, so a client cannot request an
+  unbounded result set — rejected at the boundary with a 422 before any query runs, which
+  matters as a denial-of-service control once the table is large. Path and query parameters
+  are type-validated before application code executes. The 404 body carries only the
+  resource and id, with no SQL, driver or schema detail. `ProductRead` continues to act as
+  an allow-list on the response.
+- **Open gap:** these endpoints are **unauthenticated**. Acceptable for read-only product
+  data, but `POST`/`PATCH`/`DELETE` in Step 17 must not ship without the admin-only
+  authorisation from Step 30. Recorded so it is not forgotten.
+- **Deferred:** rate limiting (Step 63), centralised error handling (Step 59), pagination
+  metadata and filtering (Step 18).
+- **Residual risk: Low** for reads; **Medium** once writes exist without authorisation.
 
 ---
 
