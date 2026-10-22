@@ -10,15 +10,11 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Query, status
 
+from app.common.schemas import Page
 from app.core.exceptions import AlreadyExistsError, NotFoundError
 from app.db.session import DbSession
 from app.modules.products import service
-from app.modules.products.schemas import (
-    ProductCreate,
-    ProductPage,
-    ProductRead,
-    ProductUpdate,
-)
+from app.modules.products.schemas import ProductCreate, ProductRead, ProductUpdate
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -39,7 +35,7 @@ def list_products(
     # column name never reaches the query.
     sort: Literal["id", "name", "price", "created_at"] = "id",
     order: Literal["asc", "desc"] = "asc",
-) -> ProductPage:
+) -> Page[ProductRead]:
     items, total = service.list_products(
         db,
         limit=limit,
@@ -51,7 +47,7 @@ def list_products(
         sort=sort,
         descending=order == "desc",
     )
-    return ProductPage(
+    return Page[ProductRead](
         items=[ProductRead.model_validate(p) for p in items],
         total=total,
         limit=limit,
