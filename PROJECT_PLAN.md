@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 19 — Explain the full request lifecycle** (Steps 1–18 complete) |
-| **Phases complete** | 2 of 12 |
-| **Steps complete** | 18 of 74 |
+| **Current step** | **Step 21 — Product–category relationship** (Steps 1–20 complete) |
+| **Phases complete** | 3 of 12 |
+| **Steps complete** | 20 of 74 |
 
 ### Goals
 
@@ -188,14 +188,14 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 16 | FastAPI routes with dependency injection | ✅ |
 | 17 | Create, list, get-by-ID, update, delete endpoints | ✅ |
 | 18 | Pagination, filtering, sorting, search, validation | ✅ |
-| 19 | Explain full request lifecycle with a real product request | 🔵 |
+| 19 | Explain full request lifecycle with a real product request | ✅ |
 
 ### Phase 4 — Categories and Relationships
 
 | # | Step | Status |
 |---|---|---|
-| 20 | Implement categories | ⬜ |
-| 21 | Product–category relationships | ⬜ |
+| 20 | Implement categories | ✅ |
+| 21 | Product–category relationships | 🔵 |
 | 22 | Explain FKs, relationship loading, lazy vs eager, N+1 | ⬜ |
 | 23 | Constraints and indexes | ⬜ |
 
@@ -1791,6 +1791,160 @@ All seeded products deleted afterwards; table left empty.
 - **Still open:** write endpoints remain unauthenticated (Step 30).
 - **Residual risk: Low** for the read path; **Medium** overall, unchanged, because of
   unauthenticated writes.
+
+---
+
+### ✅ Step 19 — Full Request Lifecycle
+
+**Completed:** 2026-10-22 · Explanation step — **no code added**. **Phase 3 complete.**
+
+Traced `GET /api/v1/products?search=traced&max_price=10&sort=price` against a live server
+with `APP_DB_ECHO=true`.
+
+**Response:** one item (`TRACE-2`, `7.50`), `total=1`, `limit=20`, `offset=0`.
+
+**SQL actually emitted:**
+
+```
+BEGIN (implicit)
+
+SELECT products.id, products.sku, ... FROM products
+WHERE (products.name ILIKE %(name_1)s::VARCHAR OR products.sku ILIKE %(sku_1)s::VARCHAR)
+  AND products.price <= %(price_1)s
+ORDER BY products.price ASC, products.id
+LIMIT %(param_1)s::INTEGER OFFSET %(param_2)s::INTEGER
+[generated in 0.00033s] {'name_1': '%traced%', 'sku_1': '%traced%',
+                         'price_1': Decimal('10'), 'param_1': 20, 'param_2': 0}
+
+SELECT count(*) AS count_1 FROM products
+WHERE (products.name ILIKE %(name_1)s::VARCHAR OR products.sku ILIKE %(sku_1)s::VARCHAR)
+  AND products.price <= %(price_1)s
+
+ROLLBACK
+```
+
+#### What the trace confirms
+
+1. **Parameters are bound, not interpolated.** The SQL text contains `%(name_1)s`
+   placeholders and the values arrive as a separate dict. This is the injection control from
+   Step 18, visible in the wire protocol rather than asserted.
+2. **Only the requested filters appear.** `is_active` and `min_price` were not sent, so no
+   condition for them was generated — `_filters()` builds conditions only for values that
+   are present.
+3. **Both queries share the same WHERE clause**, so `total` describes exactly the set the
+   page came from.
+4. **`ORDER BY products.price ASC, products.id`** — the secondary sort key is present, which
+   is what keeps paging stable when prices tie.
+5. **A read runs inside a transaction too.** PostgreSQL opens one implicitly; `BEGIN` appears
+   even though nothing is written.
+6. **`ROLLBACK`, not `COMMIT`.** The GET never called `commit()`, so `get_db`'s
+   `db.close()` rolled the (empty) read transaction back. Correct and harmless — and the
+   same mechanism that discards partial work when a write fails.
+
+#### The path a request takes
+
+```
+Uvicorn parses HTTP
+  -> FastAPI matches the route and validates query parameters (422 if invalid)
+  -> get_db opens a Session           [app/db/session.py]
+  -> router reads the request         [products/router.py]
+  -> service orchestrates             [products/service.py]
+  -> repository builds the query      [products/repository.py]
+  -> SQLAlchemy emits parameterised SQL
+  -> PostgreSQL executes
+  -> ProductRead filters the response fields
+  -> ProductPage wraps items + total
+  -> get_db closes the session (rollback on an uncommitted read)
+```
+
+Validation never reaches application code: `sort=password` and `min_price=-5` are rejected by
+FastAPI from the `Literal` and `ge=0` annotations before the router body runs.
+
+#### Risk & Controls Note
+
+Explanation step; no code or configuration changed. Two trace products were created and
+deleted, leaving the table empty. The trace provides **evidence** for a control previously
+only asserted: query values travel to PostgreSQL as bound parameters, separate from the SQL
+text. Worth noting for Step 60: `APP_DB_ECHO=true` printed the bound parameter values in
+plain text — harmless here, but once the database holds customer and payment data this
+output would be sensitive, which is why the Step 7 validator blocks it in production.
+**Residual risk: Low.**
+
+---
+
+### ✅ Step 20 — Categories Module
+
+**Completed:** 2026-10-22 · Phase 4 begins.
+
+The same five layers as products, built against the `Category` model from Step 10. No
+migration needed — the table already exists.
+
+| File | |
+|---|---|
+| `app/common/__init__.py`, `app/common/schemas.py` | **new** — shared `Page[T]` |
+| `app/modules/categories/schemas.py` | **new** |
+| `app/modules/categories/repository.py` | **new** |
+| `app/modules/categories/service.py` | **new** |
+| `app/modules/categories/router.py` | **new** — 5 endpoints |
+| `app/api/router.py` | includes the categories router |
+| `app/modules/products/{schemas,router}.py` | `ProductPage` replaced by `Page[ProductRead]` |
+
+#### The generic page envelope, now earned
+
+Step 18 deliberately used a concrete `ProductPage` and recorded that generalising would be
+justified once a second list endpoint existed. It now does, so the duplication was removed
+rather than copied:
+
+```python
+class Page[T](BaseModel):
+    items: list[T]
+    total: int
+    limit: int
+    offset: int
+```
+
+Used as `Page[ProductRead]` and `Page[CategoryRead]`. This uses Python 3.12's inline type
+parameter syntax, so no `TypeVar` declaration is needed.
+
+#### Differences from products, and why
+
+- **No price filters or sort options.** Categories have a name and a date; sorting is fixed
+  to name then id. Adding filters nothing asks for would be speculative.
+- **`update_category` also catches `IntegrityError`.** Renaming a category can collide with
+  an existing name, whereas products cannot change their SKU — so products only needed the
+  guard on create.
+
+#### Verification — live server
+
+| Request | Result |
+|---|---|
+| Routes registered | products and categories, both under `/api/v1` |
+| `POST` Books / Mugs / Electronics | 201 each |
+| `POST` Books again | **409** `Category Books already exists` |
+| `GET` list | 3 items, `total=3`, ordered by name |
+| `GET ?search=mug` | `total=1` `[Mugs]` |
+| `PATCH` id 2 → `Drinkware` | 200 |
+| `PATCH` id 2 → `Books` (taken) | **409** |
+| `GET` id 999 | **404** |
+| `DELETE` id 3 | **204** |
+| `GET /products` after the `Page` refactor | unchanged envelope — regression check passed |
+
+Test products deleted. **Two categories left in place (`Books`, `Drinkware`) as seed data for
+Step 21.**
+
+#### Risk & Controls Note
+
+- **Data:** synthetic categories only; no personal or financial data.
+- **Controls:** same as products — bound parameters throughout, `limit` capped at 100,
+  `search` capped at 100 characters, uniqueness enforced by the database constraint rather
+  than a check-then-insert, and `CategoryRead` acting as a response allow-list.
+- **Open gap, unchanged:** category write endpoints are **unauthenticated**, like products'.
+  Both must be behind admin-only authorisation (Step 30) before any shared environment.
+- **Noted for Step 21:** deleting a category currently removes the row outright. Once
+  products reference categories, the foreign key needs an explicit `ON DELETE` behaviour —
+  otherwise a delete either fails or silently orphans products.
+- **Residual risk: Medium**, unchanged — unauthenticated writes, mitigated only by
+  loopback-only exposure.
 
 ---
 
