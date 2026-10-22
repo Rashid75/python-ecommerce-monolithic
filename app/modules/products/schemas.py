@@ -53,3 +53,17 @@ class ProductRead(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class ProductPage(BaseModel):
+    """One page of products, plus what the client needs to ask for the next.
+
+    A bare list cannot say how many results exist, so the client has no way
+    to render "page 2 of 7" or know when to stop.
+    """
+
+    items: list[ProductRead]
+    # Total matching the filters, not the number in items.
+    total: int
+    limit: int
+    offset: int

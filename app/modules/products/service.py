@@ -8,6 +8,7 @@ codes is the router's job.
 """
 
 from collections.abc import Sequence
+from decimal import Decimal
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -26,8 +27,34 @@ def get_product(db: Session, product_id: int) -> Product:
     return product
 
 
-def list_products(db: Session, limit: int = 20, offset: int = 0) -> Sequence[Product]:
-    return repo.list_products(db, limit=limit, offset=offset)
+def list_products(
+    db: Session,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    search: str | None = None,
+    is_active: bool | None = None,
+    min_price: Decimal | None = None,
+    max_price: Decimal | None = None,
+    sort: str = "id",
+    descending: bool = False,
+) -> tuple[Sequence[Product], int]:
+    """Return one page of products and the total number that match.
+
+    Both queries use the same filters, so the total always describes the
+    same set the page was taken from.
+    """
+    filters = {
+        "search": search,
+        "is_active": is_active,
+        "min_price": min_price,
+        "max_price": max_price,
+    }
+    items = repo.list_products(
+        db, limit=limit, offset=offset, sort=sort, descending=descending, **filters
+    )
+    total = repo.count_products(db, **filters)
+    return items, total
 
 
 def create_product(db: Session, data: ProductCreate) -> Product:

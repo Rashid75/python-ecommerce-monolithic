@@ -5,12 +5,20 @@ service, and turns application errors into status codes. No business rules
 and no database queries live here.
 """
 
+from decimal import Decimal
+from typing import Annotated, Literal
+
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.core.exceptions import AlreadyExistsError, NotFoundError
 from app.db.session import DbSession
 from app.modules.products import service
-from app.modules.products.schemas import ProductCreate, ProductRead, ProductUpdate
+from app.modules.products.schemas import (
+    ProductCreate,
+    ProductPage,
+    ProductRead,
+    ProductUpdate,
+)
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -20,10 +28,35 @@ def list_products(
     db: DbSession,
     # Query(...) turns these into ?limit=&offset= with validation attached.
     # The upper bound on limit stops a client asking for a million rows.
-    limit: int = Query(default=20, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
-) -> list[ProductRead]:
-    return list(service.list_products(db, limit=limit, offset=offset))
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    search: Annotated[str | None, Query(max_length=100, description="Match name or SKU")] = None,
+    is_active: Annotated[bool | None, Query()] = None,
+    min_price: Annotated[Decimal | None, Query(ge=0)] = None,
+    max_price: Annotated[Decimal | None, Query(ge=0)] = None,
+    # Literal restricts the value to these four. FastAPI rejects anything
+    # else with a 422 and lists the choices in the docs, so an unknown
+    # column name never reaches the query.
+    sort: Literal["id", "name", "price", "created_at"] = "id",
+    order: Literal["asc", "desc"] = "asc",
+) -> ProductPage:
+    items, total = service.list_products(
+        db,
+        limit=limit,
+        offset=offset,
+        search=search,
+        is_active=is_active,
+        min_price=min_price,
+        max_price=max_price,
+        sort=sort,
+        descending=order == "desc",
+    )
+    return ProductPage(
+        items=[ProductRead.model_validate(p) for p in items],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{product_id}", summary="Get one product")

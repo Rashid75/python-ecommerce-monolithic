@@ -6,11 +6,23 @@ transaction - these functions never commit.
 """
 
 from collections.abc import Sequence
+from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.modules.products.models import Product
+
+# Only these columns may be sorted on. The query parameter is looked up in
+# this dict, never put into the SQL itself: a column name cannot be a bound
+# parameter, so interpolating one straight from a request would be an
+# injection hole. An unknown key simply fails the lookup.
+SORTABLE_COLUMNS = {
+    "id": Product.id,
+    "name": Product.name,
+    "price": Product.price,
+    "created_at": Product.created_at,
+}
 
 
 def get_by_id(db: Session, product_id: int) -> Product | None:
@@ -26,14 +38,75 @@ def get_by_sku(db: Session, sku: str) -> Product | None:
     return db.scalar(select(Product).where(Product.sku == sku))
 
 
-def list_products(db: Session, limit: int = 20, offset: int = 0) -> Sequence[Product]:
-    """Fetch a page of products, newest last.
+def _filters(
+    search: str | None,
+    is_active: bool | None,
+    min_price: Decimal | None,
+    max_price: Decimal | None,
+) -> list[ColumnElement[bool]]:
+    """Build the WHERE conditions shared by the list and count queries.
 
-    limit and offset are always applied. A query with no limit works fine on
-    ten rows and takes the server down on ten million.
+    Returning conditions rather than a finished query means the two cannot
+    drift apart and report different totals.
     """
-    stmt = select(Product).order_by(Product.id).limit(limit).offset(offset)
+    conditions: list[ColumnElement[bool]] = []
+    if search:
+        # ilike is case-insensitive LIKE. The pattern is a bound parameter,
+        # so the value never becomes part of the SQL text.
+        pattern = f"%{search}%"
+        conditions.append(or_(Product.name.ilike(pattern), Product.sku.ilike(pattern)))
+    if is_active is not None:
+        conditions.append(Product.is_active == is_active)
+    if min_price is not None:
+        conditions.append(Product.price >= min_price)
+    if max_price is not None:
+        conditions.append(Product.price <= max_price)
+    return conditions
+
+
+def list_products(
+    db: Session,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    search: str | None = None,
+    is_active: bool | None = None,
+    min_price: Decimal | None = None,
+    max_price: Decimal | None = None,
+    sort: str = "id",
+    descending: bool = False,
+) -> Sequence[Product]:
+    """Fetch one page of products."""
+    column = SORTABLE_COLUMNS[sort]
+    stmt = (
+        select(Product)
+        .where(*_filters(search, is_active, min_price, max_price))
+        .order_by(column.desc() if descending else column.asc())
+        # id is unique, so adding it makes the order total. Without a
+        # tiebreaker, rows with equal prices can swap between pages and a
+        # product appears twice or not at all.
+        .order_by(Product.id)
+        .limit(limit)
+        .offset(offset)
+    )
     return db.scalars(stmt).all()
+
+
+def count_products(
+    db: Session,
+    *,
+    search: str | None = None,
+    is_active: bool | None = None,
+    min_price: Decimal | None = None,
+    max_price: Decimal | None = None,
+) -> int:
+    """Count products matching the same filters, ignoring limit and offset."""
+    stmt = (
+        select(func.count())
+        .select_from(Product)
+        .where(*_filters(search, is_active, min_price, max_price))
+    )
+    return db.scalar(stmt) or 0
 
 
 def add(db: Session, product: Product) -> Product:

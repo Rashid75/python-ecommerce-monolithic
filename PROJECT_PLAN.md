@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 18 — Pagination, filtering, sorting, search** (Steps 1–17 complete) |
+| **Current step** | **Step 19 — Explain the full request lifecycle** (Steps 1–18 complete) |
 | **Phases complete** | 2 of 12 |
-| **Steps complete** | 17 of 74 |
+| **Steps complete** | 18 of 74 |
 
 ### Goals
 
@@ -187,8 +187,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 15 | Product service and business rules | ✅ |
 | 16 | FastAPI routes with dependency injection | ✅ |
 | 17 | Create, list, get-by-ID, update, delete endpoints | ✅ |
-| 18 | Pagination, filtering, sorting, search, validation | 🔵 |
-| 19 | Explain full request lifecycle with a real product request | ⬜ |
+| 18 | Pagination, filtering, sorting, search, validation | ✅ |
+| 19 | Explain full request lifecycle with a real product request | 🔵 |
 
 ### Phase 4 — Categories and Relationships
 
@@ -1716,6 +1716,81 @@ the abstraction speculatively.
   regulated context; rate limiting (Step 63); centralised error handling (Step 59).
 - **Residual risk: Medium** — unauthenticated write access to product and pricing data,
   mitigated for now only by local-only network exposure.
+
+---
+
+### ✅ Step 18 — Pagination, Filtering, Sorting and Search
+
+**Completed:** 2026-10-22
+
+`GET /api/v1/products` now accepts `limit`, `offset`, `search`, `is_active`, `min_price`,
+`max_price`, `sort` and `order`, and returns a `ProductPage` envelope rather than a bare list.
+
+#### Decisions
+
+**A response envelope, not a bare list.** `{items, total, limit, offset}` — a bare list
+cannot say how many results exist, so a client cannot render "page 2 of 7" or know when to
+stop.
+
+**Sortable columns come from a dict, never from the request.** A column name cannot be a
+bound parameter, so interpolating one from user input would be a genuine injection hole.
+`SORTABLE_COLUMNS` maps the four permitted names to columns, and `Literal[...]` on the query
+parameter means FastAPI rejects anything else with a 422 before the lookup is reached.
+
+**Filters are returned as a list of conditions, not a finished query.** `_filters()` is used
+by both the page query and the count query, so the two cannot drift apart and report a total
+that does not match the page.
+
+**`id` is added as a secondary sort key.** Without a tiebreaker, rows with equal prices can
+swap positions between pages, so a product appears twice or is skipped entirely.
+
+**`Annotated[...]` form for query parameters** rather than `= Query(...)` defaults. It is the
+current FastAPI style and avoids Ruff's B008 (a function call in an argument default).
+
+**A concrete `ProductPage`, not a generic `Page[T]`.** There is one list endpoint. When
+categories gets one, the duplication will be real and generalising will be justified.
+
+#### Verification — live server, 5 seeded products
+
+| Request | Result |
+|---|---|
+| `limit=2&offset=0` / `2` / `4` | 2, 2 then 1 item; `total=5` throughout |
+| `search=mug` | 2 — matched **name** (`Coffee Mug`, `Travel Mug`) |
+| `search=BK` | 3 — matched **SKU** |
+| `search=clean` | 1 — case-insensitive (`Clean Code`) |
+| `min_price=30` | 2 (`45.50`, `39.00`) |
+| `max_price=20` | 2 (`8.75`, `15.00`) |
+| `min_price=20&max_price=40` | 2 (`29.99`, `39.00`) |
+| `sort=price&order=asc` | `8.75, 15.00, 29.99, 39.00, 45.50` |
+| `sort=price&order=desc` | exact reverse |
+| `search=mug&max_price=10&sort=price` | 1 — filters combine |
+| `sort=password` | **422** — `Input should be 'id', 'name', 'price' or 'created_at'` |
+| `sort=id;DROP TABLE products` | **422** — same |
+| `min_price=-5` | **422** |
+| `search=' ; DROP TABLE products;--` | **200**, `total=0` — treated as literal text |
+
+All seeded products deleted afterwards; table left empty.
+
+#### Risk & Controls Note
+
+- **Data:** synthetic products, created and removed within the check.
+- **Controls — injection surface closed two ways.** Values travel as bound parameters, so
+  `search=' ; DROP TABLE products;--` was matched as literal text and returned an empty
+  result rather than executing. Column names, which *cannot* be bound parameters and are the
+  usual injection route in sort features, come from a server-side allow-list and are
+  additionally rejected at the boundary by `Literal`. `limit` stays capped at 100 and
+  `search` at 100 characters, bounding both result size and pattern cost.
+- **Known limitation:** `%` and `_` in `search` are LIKE wildcards and are not escaped, so a
+  user can broaden their own search. Not an injection or disclosure issue — the result set is
+  the same public product list either way — but worth escaping when search is revisited at
+  Step 64.
+- **Performance note for Step 64:** `search` uses a leading-wildcard `ILIKE`, which cannot
+  use a normal B-tree index and will scan the table as it grows. `OFFSET` also gets more
+  expensive on deep pages. Both are fine at current scale; a trigram index and keyset
+  pagination are the answers.
+- **Still open:** write endpoints remain unauthenticated (Step 30).
+- **Residual risk: Low** for the read path; **Medium** overall, unchanged, because of
+  unauthenticated writes.
 
 ---
 
