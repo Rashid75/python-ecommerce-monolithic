@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 21 — Product–category relationship** (Steps 1–20 complete) |
+| **Current step** | **Step 22 — Relationship loading and N+1** (Steps 1–21 complete) |
 | **Phases complete** | 3 of 12 |
-| **Steps complete** | 20 of 74 |
+| **Steps complete** | 21 of 74 |
 
 ### Goals
 
@@ -195,8 +195,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | # | Step | Status |
 |---|---|---|
 | 20 | Implement categories | ✅ |
-| 21 | Product–category relationships | 🔵 |
-| 22 | Explain FKs, relationship loading, lazy vs eager, N+1 | ⬜ |
+| 21 | Product–category relationships | ✅ |
+| 22 | Explain FKs, relationship loading, lazy vs eager, N+1 | 🔵 |
 | 23 | Constraints and indexes | ⬜ |
 
 ### Phase 5 — Users and Authentication
@@ -1945,6 +1945,90 @@ Step 21.**
   otherwise a delete either fails or silently orphans products.
 - **Residual risk: Medium**, unchanged — unauthenticated writes, mitigated only by
   loopback-only exposure.
+
+---
+
+### ✅ Step 21 — Product–Category Relationship
+
+**Completed:** 2026-10-22 · Migration generated and applied by the user.
+
+`products.category_id` references `categories.id`. One category per product; a product may
+have none.
+
+#### The ON DELETE decision
+
+What happens when someone deletes a category that products still use? Three options, only
+one acceptable:
+
+| Option | Effect | Verdict |
+|---|---|---|
+| `CASCADE` | Deleting a category **deletes its products** | Never. Silent, large data loss from a small action. |
+| `SET NULL` | Products quietly become uncategorised | Safe but silent — the change is invisible until someone notices. |
+| **`RESTRICT`** | PostgreSQL refuses the delete | **Chosen.** Fails loudly; someone must deliberately move or uncategorise the products first. |
+
+`delete_category` converts the resulting `IntegrityError` into `InUseError`, which the
+router returns as **409** with a message naming the reason.
+
+#### Other decisions
+
+- **Nullable `category_id`.** A product can exist before anyone decides where it belongs,
+  and requiring it would have meant backfilling if rows already existed.
+- **`index=True` on the foreign key.** PostgreSQL does *not* index foreign keys
+  automatically, and "products in this category" filters on it constantly.
+- **The service checks the category exists** before insert, producing a clear 404. The
+  foreign key would also reject it, but a raw constraint violation tells a client nothing.
+- **`TYPE_CHECKING` imports** on both models. Each refers to the other, so real imports
+  would be circular; SQLAlchemy resolves `"Category"` and `"Product"` by name at mapper
+  configuration time.
+- **`InUseError` added** to `app/core/exceptions.py`, mapping to 409 like
+  `AlreadyExistsError` — the request is valid, it conflicts with current data.
+- **`category_id` filter** added to the product list endpoint, threaded through router,
+  service and repository.
+
+#### Bug found by testing: the ORM bypassed the constraint
+
+The first implementation looked correct and was not. `DELETE /categories/{id}` on a category
+with products returned **204** — the category was deleted and the product's `category_id`
+became `NULL`.
+
+PostgreSQL was configured correctly (`confdeltype = 'r'`). The ORM was the problem: on
+`db.delete(category)`, SQLAlchemy's default behaviour is to **load the related products and
+set their foreign key to NULL before issuing the DELETE**, so the database never saw a
+violation. The result was exactly the silent `SET NULL` behaviour that was rejected above,
+produced by the ORM rather than the schema.
+
+Fixed with `passive_deletes="all"` on `Category.products`, which tells SQLAlchemy to leave
+the children untouched and let the database decide.
+
+**Lesson recorded:** a correct schema does not guarantee correct behaviour. The constraint
+has to be tested through the application, not confirmed in `psql`. Verifying
+`confdeltype = 'r'` alone would have passed this step with the protection disabled.
+
+#### Verification — after the fix
+
+| Check | Result |
+|---|---|
+| `Product.category` / foreign key | resolves to `Category`, `ForeignKey('categories.id')` |
+| `POST` product with valid `category_id` | **201**, `category_id` set |
+| `POST` product with `category_id=9999` | **404** `Category 9999 does not exist` |
+| `GET /products?category_id=2` | `total=1` |
+| Migration contents | `nullable=True`, `ix_products_category_id`, `ondelete='RESTRICT'` |
+| **`DELETE` a category with products** | **409** `Category 2 still has products and cannot be deleted` |
+| Category after the failed delete | still exists |
+| Product after the failed delete | still linked, `category_id=2` |
+
+#### Risk & Controls Note
+
+- **Controls:** `RESTRICT` is a data-integrity control chosen deliberately over the
+  convenient options — referential actions that silently delete or null out rows are a
+  recognised cause of unexplained data loss, and in a regulated context an unexplained
+  change to records is worse than a failed request. The service's existence check means a
+  bad `category_id` produces a 404 rather than leaking a constraint-violation message.
+- **Deferred:** `ON DELETE` behaviour will need revisiting at Step 45 when order items
+  reference products — order history must survive a product being withdrawn, which is why
+  `is_active` exists and why deleting products outright becomes questionable then.
+- **Unchanged:** write endpoints remain unauthenticated until Step 30.
+- **Residual risk: Medium**, unchanged.
 
 ---
 

@@ -30,6 +30,7 @@ def list_products(
     is_active: Annotated[bool | None, Query()] = None,
     min_price: Annotated[Decimal | None, Query(ge=0)] = None,
     max_price: Annotated[Decimal | None, Query(ge=0)] = None,
+    category_id: Annotated[int | None, Query(ge=1)] = None,
     # Literal restricts the value to these four. FastAPI rejects anything
     # else with a 422 and lists the choices in the docs, so an unknown
     # column name never reaches the query.
@@ -44,6 +45,7 @@ def list_products(
         is_active=is_active,
         min_price=min_price,
         max_price=max_price,
+        category_id=category_id,
         sort=sort,
         descending=order == "desc",
     )
@@ -71,6 +73,9 @@ def get_product(product_id: int, db: DbSession) -> ProductRead:
 def create_product(data: ProductCreate, db: DbSession) -> ProductRead:
     try:
         return service.create_product(db, data)
+    except NotFoundError as exc:
+        # An unknown category_id. 404 names the thing that was not found.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except AlreadyExistsError as exc:
         # 409 Conflict, not 400: the request is well formed, it just clashes
         # with something that already exists.

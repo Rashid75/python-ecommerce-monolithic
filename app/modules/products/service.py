@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import AlreadyExistsError, NotFoundError
+from app.modules.categories import repository as category_repo
 from app.modules.products import repository as repo
 from app.modules.products.models import Product
 from app.modules.products.schemas import ProductCreate, ProductUpdate
@@ -36,6 +37,7 @@ def list_products(
     is_active: bool | None = None,
     min_price: Decimal | None = None,
     max_price: Decimal | None = None,
+    category_id: int | None = None,
     sort: str = "id",
     descending: bool = False,
 ) -> tuple[Sequence[Product], int]:
@@ -49,6 +51,7 @@ def list_products(
         "is_active": is_active,
         "min_price": min_price,
         "max_price": max_price,
+        "category_id": category_id,
     }
     items = repo.list_products(
         db, limit=limit, offset=offset, sort=sort, descending=descending, **filters
@@ -57,8 +60,21 @@ def list_products(
     return items, total
 
 
+def _check_category_exists(db: Session, category_id: int | None) -> None:
+    """Reject a category id that does not exist.
+
+    The foreign key would also stop it, but the database error says nothing
+    useful to a client. Checking here produces a clear 404 instead.
+    """
+    if category_id is None:
+        return
+    if category_repo.get_by_id(db, category_id) is None:
+        raise NotFoundError(f"Category {category_id} does not exist")
+
+
 def create_product(db: Session, data: ProductCreate) -> Product:
     """Create a product, rejecting a SKU that is already taken."""
+    _check_category_exists(db, data.category_id)
     product = Product(**data.model_dump())
     try:
         repo.add(db, product)
@@ -76,9 +92,12 @@ def create_product(db: Session, data: ProductCreate) -> Product:
 def update_product(db: Session, product_id: int, data: ProductUpdate) -> Product:
     """Apply a partial update to an existing product."""
     product = get_product(db, product_id)
+    changes = data.model_dump(exclude_unset=True)
+    if "category_id" in changes:
+        _check_category_exists(db, changes["category_id"])
     # exclude_unset keeps fields the client did not send untouched.
     # Without it every absent field would arrive as None and wipe good data.
-    for field, value in data.model_dump(exclude_unset=True).items():
+    for field, value in changes.items():
         setattr(product, field, value)
     db.commit()
     return product

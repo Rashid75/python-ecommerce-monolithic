@@ -43,6 +43,7 @@ def _filters(
     is_active: bool | None,
     min_price: Decimal | None,
     max_price: Decimal | None,
+    category_id: int | None = None,
 ) -> list[ColumnElement[bool]]:
     """Build the WHERE conditions shared by the list and count queries.
 
@@ -61,6 +62,8 @@ def _filters(
         conditions.append(Product.price >= min_price)
     if max_price is not None:
         conditions.append(Product.price <= max_price)
+    if category_id is not None:
+        conditions.append(Product.category_id == category_id)
     return conditions
 
 
@@ -73,6 +76,7 @@ def list_products(
     is_active: bool | None = None,
     min_price: Decimal | None = None,
     max_price: Decimal | None = None,
+    category_id: int | None = None,
     sort: str = "id",
     descending: bool = False,
 ) -> Sequence[Product]:
@@ -80,7 +84,7 @@ def list_products(
     column = SORTABLE_COLUMNS[sort]
     stmt = (
         select(Product)
-        .where(*_filters(search, is_active, min_price, max_price))
+        .where(*_filters(search, is_active, min_price, max_price, category_id))
         .order_by(column.desc() if descending else column.asc())
         # id is unique, so adding it makes the order total. Without a
         # tiebreaker, rows with equal prices can swap between pages and a
@@ -99,12 +103,13 @@ def count_products(
     is_active: bool | None = None,
     min_price: Decimal | None = None,
     max_price: Decimal | None = None,
+    category_id: int | None = None,
 ) -> int:
     """Count products matching the same filters, ignoring limit and offset."""
     stmt = (
         select(func.count())
         .select_from(Product)
-        .where(*_filters(search, is_active, min_price, max_price))
+        .where(*_filters(search, is_active, min_price, max_price, category_id))
     )
     return db.scalar(stmt) or 0
 

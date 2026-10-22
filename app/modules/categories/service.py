@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import AlreadyExistsError, NotFoundError
+from app.core.exceptions import AlreadyExistsError, InUseError, NotFoundError
 from app.modules.categories import repository as repo
 from app.modules.categories.models import Category
 from app.modules.categories.schemas import CategoryCreate, CategoryUpdate
@@ -54,4 +54,12 @@ def update_category(db: Session, category_id: int, data: CategoryUpdate) -> Cate
 def delete_category(db: Session, category_id: int) -> None:
     category = get_category(db, category_id)
     repo.remove(db, category)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # ON DELETE RESTRICT on products.category_id. Deleting a category
+        # that products still use must not silently remove or orphan them.
+        db.rollback()
+        raise InUseError(
+            f"Category {category_id} still has products and cannot be deleted"
+        ) from exc

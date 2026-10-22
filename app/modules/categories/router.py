@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.common.schemas import Page
-from app.core.exceptions import AlreadyExistsError, NotFoundError
+from app.core.exceptions import AlreadyExistsError, InUseError, NotFoundError
 from app.db.session import DbSession
 from app.modules.categories import service
 from app.modules.categories.schemas import CategoryCreate, CategoryRead, CategoryUpdate
@@ -63,3 +63,5 @@ def delete_category(category_id: int, db: DbSession) -> None:
         service.delete_category(db, category_id)
     except NotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except InUseError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc

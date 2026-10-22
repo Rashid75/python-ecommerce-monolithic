@@ -23,6 +23,9 @@ class ProductCreate(BaseModel):
     # silently by the NUMERIC(12, 2) column.
     price: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
     is_active: bool = True
+    # Optional: a product can exist before it is filed under a category.
+    # The service checks that the category actually exists.
+    category_id: int | None = None
 
 
 class ProductUpdate(BaseModel):
@@ -36,6 +39,7 @@ class ProductUpdate(BaseModel):
     description: str | None = None
     price: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
     is_active: bool | None = None
+    category_id: int | None = None
 
 
 class ProductRead(BaseModel):
@@ -51,6 +55,7 @@ class ProductRead(BaseModel):
     description: str | None
     price: Decimal
     is_active: bool
+    category_id: int | None
     created_at: datetime
     updated_at: datetime
 

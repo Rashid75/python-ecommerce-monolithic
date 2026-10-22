@@ -16,3 +16,11 @@ class NotFoundError(AppError):
 
 class AlreadyExistsError(AppError):
     """Something unique already uses that value. The router maps this to 409."""
+
+
+class InUseError(AppError):
+    """Something else still refers to this, so it cannot be removed.
+
+    The router maps this to 409 as well: the request is valid, it just
+    conflicts with the current state of the data.
+    """

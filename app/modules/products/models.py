@@ -2,11 +2,15 @@
 
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, DateTime, Numeric, String, Text, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Numeric, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+if TYPE_CHECKING:
+    from app.modules.categories.models import Category
 
 
 class Product(Base):
@@ -38,6 +42,22 @@ class Product(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+    # Nullable: a product can exist before anyone decides where it belongs.
+    #
+    # ondelete="RESTRICT" is the important part. PostgreSQL refuses to delete
+    # a category while products still point at it. The alternatives are worse:
+    # CASCADE would silently delete the products along with the category, and
+    # SET NULL would quietly uncategorise them. RESTRICT makes someone decide.
+    #
+    # index=True because every "products in this category" query filters on
+    # it, and a foreign key does not get an index automatically in PostgreSQL.
+    category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("categories.id", ondelete="RESTRICT"), index=True, default=None
+    )
+
+    # Lets you write product.category in Python. Adds no column of its own.
+    category: Mapped["Category | None"] = relationship(back_populates="products")
 
     __table_args__ = (
         # The database refuses a negative price even if application code
