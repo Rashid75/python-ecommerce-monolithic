@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 15 — Product service and business rules** (Steps 1–14 complete) |
+| **Current step** | **Step 16 — FastAPI routes with dependency injection** (Steps 1–15 complete) |
 | **Phases complete** | 2 of 12 |
-| **Steps complete** | 14 of 74 |
+| **Steps complete** | 15 of 74 |
 
 ### Goals
 
@@ -184,8 +184,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 12 | Design product table and constraints | ✅ |
 | 13 | Pydantic request/response schemas | ✅ |
 | 14 | Product repository | ✅ |
-| 15 | Product service and business rules | 🔵 |
-| 16 | FastAPI routes with dependency injection | ⬜ |
+| 15 | Product service and business rules | ✅ |
+| 16 | FastAPI routes with dependency injection | 🔵 |
 | 17 | Create, list, get-by-ID, update, delete endpoints | ⬜ |
 | 18 | Pagination, filtering, sorting, search, validation | ⬜ |
 | 19 | Explain full request lifecycle with a real product request | ⬜ |
@@ -1507,6 +1507,81 @@ which is the same mechanism that will make checkout atomic in Step 47.
 - **Deferred:** filtering, sorting and search (Step 18); keyset pagination if `offset` on
   large tables becomes slow (Step 64); soft-delete policy — `remove()` currently deletes the
   row, which Step 51 should revisit once orders reference products.
+- **Residual risk: Low.**
+
+---
+
+### ✅ Step 15 — Product Service and Business Rules
+
+**Completed:** 2026-10-21
+
+Two new files.
+
+`app/core/exceptions.py` — `AppError` base with `NotFoundError` and `AlreadyExistsError`.
+Services raise these; the router maps them to status codes, so business rules never need to
+know what a 404 is. Step 59 moves that mapping into one place.
+
+`app/modules/products/service.py` — `get_product`, `list_products`, `create_product`,
+`update_product`, `delete_product`. **The service is the only layer that calls `commit()`**,
+completing the split established in Step 7: `get_db` owns the session's lifetime, the
+repository stages work, the service decides when a unit of work is finished.
+
+#### Key decision: no check-then-insert for SKU uniqueness
+
+The obvious implementation asks "does this SKU exist?" then inserts. That leaves a gap
+between the check and the insert, and two requests arriving together can both pass it. The
+service instead attempts the insert and converts `IntegrityError` into
+`AlreadyExistsError`:
+
+```python
+try:
+    repo.add(db, product)
+    db.commit()
+except IntegrityError as exc:
+    db.rollback()
+    raise AlreadyExistsError(f"SKU {data.sku} is already in use") from exc
+```
+
+Shorter than the check-first version *and* race-free, because the unique constraint cannot
+be raced. The `rollback()` is required: a failed statement leaves the session unusable until
+the transaction is cleared. Verified — `get_product` worked immediately after the failed
+insert.
+
+Noted limitation: this assumes any `IntegrityError` on `products` is a SKU conflict, which
+holds while `uq_products_sku` is the only unique constraint on the table. Revisit when a
+second one is added.
+
+#### Verification — ran against the real database, committing
+
+| Check | Result |
+|---|---|
+| `create_product` | `id=4 sku=SVC-001 price=29.99` |
+| Duplicate SKU | `AlreadyExistsError: SKU SVC-001 is already in use` |
+| Session usable after the failed insert | `get_product` returned `Clean Code` |
+| `get_product(999999)` | `NotFoundError: Product 999999 does not exist` |
+| Partial update `{price}` only | price `29.99 → 24.99`; name, description, is_active **unchanged** |
+| `update_product(999999, ...)` | `NotFoundError` |
+| Read from a **second session** | `24.99` — the commit was real, not session-local |
+| `delete_product` | gone |
+| Cleanup | 0 products left |
+
+The second-session read matters: it proves `commit()` made the change visible outside the
+session, rather than it merely looking right inside one.
+
+#### Risk & Controls Note
+
+- **Data:** synthetic rows, created and deleted within the check.
+- **Controls:** uniqueness enforced by the database constraint rather than an application
+  check, removing a time-of-check/time-of-use race — the same class of flaw that causes
+  double-spend and duplicate-order defects, so the pattern matters well beyond SKUs.
+  `exclude_unset` prevents a partial update silently nulling fields the client never sent, a
+  common cause of unintended data loss. Application errors carry no internal detail —
+  messages name the resource and id only, no SQL, driver or schema information. `rollback()`
+  on failure prevents a broken transaction holding locks.
+- **Deferred:** authorisation, so only administrators may create, update or delete products
+  (Step 30); mapping `AppError` subclasses to HTTP status codes centrally (Step 59);
+  distinguishing which unique constraint an `IntegrityError` came from, once products has
+  more than one.
 - **Residual risk: Low.**
 
 ---
