@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 17 — Create, update and delete endpoints** (Steps 1–16 complete) |
+| **Current step** | **Step 18 — Pagination, filtering, sorting, search** (Steps 1–17 complete) |
 | **Phases complete** | 2 of 12 |
-| **Steps complete** | 16 of 74 |
+| **Steps complete** | 17 of 74 |
 
 ### Goals
 
@@ -186,8 +186,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 14 | Product repository | ✅ |
 | 15 | Product service and business rules | ✅ |
 | 16 | FastAPI routes with dependency injection | ✅ |
-| 17 | Create, list, get-by-ID, update, delete endpoints | 🔵 |
-| 18 | Pagination, filtering, sorting, search, validation | ⬜ |
+| 17 | Create, list, get-by-ID, update, delete endpoints | ✅ |
+| 18 | Pagination, filtering, sorting, search, validation | 🔵 |
 | 19 | Explain full request lifecycle with a real product request | ⬜ |
 
 ### Phase 4 — Categories and Relationships
@@ -1648,6 +1648,74 @@ Ruff began reformatting Python samples inside `PROJECT_PLAN.md`; `*.md` added to
 - **Deferred:** rate limiting (Step 63), centralised error handling (Step 59), pagination
   metadata and filtering (Step 18).
 - **Residual risk: Low** for reads; **Medium** once writes exist without authorisation.
+
+---
+
+### ✅ Step 17 — Create, Update and Delete Endpoints
+
+**Completed:** 2026-10-22 · Product CRUD complete.
+
+| Endpoint | Status | Notes |
+|---|---|---|
+| `GET /products` | 200 | |
+| `GET /products/{id}` | 200 / 404 | |
+| `POST /products` | **201** | `status_code` set explicitly; FastAPI defaults to 200 |
+| `PATCH /products/{id}` | 200 / 404 | PATCH, not PUT — partial update |
+| `DELETE /products/{id}` | **204** / 404 | No body on success |
+
+#### Status code decisions
+
+- **201 Created** for POST. The default 200 would be wrong for a request that creates a
+  resource.
+- **409 Conflict**, not 400, for a duplicate SKU. The request is well formed; it clashes with
+  existing state. 400 would tell the client to fix its syntax, which is misleading.
+- **PATCH, not PUT.** The client sends only the fields it wants to change. PUT means "replace
+  the whole product with this", which would require every field on every edit.
+- **204 No Content** for DELETE. It worked, and there is nothing to return.
+
+#### Verification — live server, full cycle
+
+| Request | Response |
+|---|---|
+| `POST` valid product | `{"id":6,...,"price":"29.99"}` · **201** |
+| `POST` same SKU again | `{"detail":"SKU API-001 is already in use"}` · **409** |
+| `POST` price `-5.00` | `greater_than_equal` error · **422** — never reached the service |
+| `GET` list | the created product · 200 |
+| `PATCH` price only | price `29.99 → 24.99`, other fields unchanged · 200 |
+| `PATCH` missing id | `{"detail":"Product 999 does not exist"}` · 404 |
+| `DELETE` | empty body · **204** |
+| `GET` after delete | 404 |
+| `DELETE` again | 404 — not an error, it is simply gone |
+| Final list | `[]` · 200 — nothing left behind |
+
+**`updated_at` moved on the PATCH** (`07:42:27 → 07:42:49`) while `created_at` stayed put,
+confirming the `onupdate=func.now()` from Step 12 works through the whole stack.
+
+#### Observation for Step 59
+
+Every write endpoint now repeats the same `try/except … raise HTTPException` block. Five
+endpoints, four of those blocks. This is exactly the duplication centralised exception
+handling removes, and it is the concrete problem that justifies Step 59 rather than adding
+the abstraction speculatively.
+
+#### Risk & Controls Note
+
+- **Data:** synthetic product, created and deleted within the check; table left empty.
+- **Controls:** a negative price was rejected with a 422 **before reaching the service**,
+  demonstrating the layered defence — schema validation at the boundary, business rules in
+  the service, check constraint in the database. Duplicate SKU returns a clean 409 rather
+  than a 500, because the service converts `IntegrityError` rather than letting it escape.
+  Error bodies carry only the resource and id.
+- **Open gap, now material:** `POST`, `PATCH` and `DELETE` are **unauthenticated**. Anyone
+  who can reach the service can create, alter or delete products, including changing prices.
+  Acceptable only because the application is bound to loopback on a development machine.
+  **These endpoints must not reach any shared or deployed environment before Step 30 adds
+  admin-only authorisation.**
+- **Deferred:** authorisation (Step 30); audit logging of who changed a price and when
+  (Step 60) — price changes are exactly the kind of event that needs an audit trail in a
+  regulated context; rate limiting (Step 63); centralised error handling (Step 59).
+- **Residual risk: Medium** — unauthenticated write access to product and pricing data,
+  mitigated for now only by local-only network exposure.
 
 ---
 
