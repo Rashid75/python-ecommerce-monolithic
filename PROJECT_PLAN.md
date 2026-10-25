@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 24 — User model and migration** (Steps 1–23 complete, Phase 4 done) |
+| **Current step** | **Step 25 — Registration and password hashing** (Steps 1–24 complete) |
 | **Phases complete** | 4 of 12 |
-| **Steps complete** | 23 of 74 |
+| **Steps complete** | 24 of 74 |
 
 ### Goals
 
@@ -203,8 +203,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 
 | # | Step | Status |
 |---|---|---|
-| 24 | User model and migration | ⬜ |
-| 25 | Registration and password hashing | ⬜ |
+| 24 | User model and migration | ✅ |
+| 25 | Registration and password hashing | 🔵 |
 | 26 | Login | ⬜ |
 | 27 | Generate and validate JWT access tokens | ⬜ |
 | 28 | Current-user retrieval via FastAPI dependencies | ⬜ |
@@ -2152,6 +2152,64 @@ column lets the new index serve the query.
   B-tree); indexes for sorting by `name`, `price` or `created_at` once query patterns are
   known from real use rather than guessed.
 - **Residual risk: Low.**
+
+---
+
+### ✅ Step 24 — User Model
+
+**Completed:** 2026-10-25 · Phase 5 begins. Migration run by the user.
+
+`app/modules/users/models.py`:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER` PK | |
+| `email` | `VARCHAR(320)` | 320 is the maximum length an email address can be |
+| `password_hash` | `VARCHAR(255)` | The Argon2 hash. **Never** a plaintext password |
+| `is_active` | `BOOLEAN` default `true` | Disable an account without deleting it, so past orders stay meaningful |
+| `created_at` / `updated_at` | `TIMESTAMPTZ` | |
+
+Index: `uq_users_lower_email`, unique on `lower(email)`.
+
+#### Decisions
+
+**Case-insensitive email**, using the same pattern established in Step 23. Nobody expects
+`Rashid@x.com` and `rashid@x.com` to be separate accounts, and permitting both invites
+sign-in confusion and impersonation through a lookalike address.
+
+**The column is named `password_hash`, not `password`.** The name states what is stored. A
+column called `password` invites someone to put a password in it.
+
+**No `role` column yet.** Step 30 adds roles with its own migration. Keeping each step to
+one change also exercises normal schema evolution.
+
+**No relationship to orders or addresses yet** — those tables do not exist until Phases 8
+and 9.
+
+#### Verified before the migration
+
+Six columns with correct types and nullability, and one unique index on `lower(email)`.
+
+#### Risk & Controls Note
+
+- **This is the first table holding personal data.** An email address is personal data under
+  PDPL and the UAE/Bahrain equivalents, so from here the standing commitments apply in
+  practice rather than in principle: synthetic addresses only in development, and no real
+  customer data copied into this environment.
+- **Controls in place by design:** the password hash column is isolated and will never
+  appear in a response schema — `UserRead` in Step 25 simply will not list it, which is the
+  allow-list behaviour already proven on `ProductRead`. `is_active` allows deactivation
+  instead of deletion, preserving the audit trail that order history depends on. Email
+  uniqueness is enforced by the database, case-insensitively, so duplicate accounts cannot
+  be created by an import or a script that bypasses the API.
+- **Required next, not optional:** Step 25 must hash with Argon2 before any user row is
+  written. No endpoint accepts a user until then.
+- **Deferred and tracked:** password reset tokens and their expiry; account lockout after
+  repeated failures (Step 63 rate limiting); audit logging of authentication events
+  (Step 60) — in a regulated context, failed sign-ins are a required trail; encryption at
+  rest for the database volume (Phase 12); a retention and deletion policy for user records,
+  which PDPL requires and which Step 74 should cover.
+- **Residual risk: Low** today, since the table is empty and no endpoint writes to it.
 
 ---
 
