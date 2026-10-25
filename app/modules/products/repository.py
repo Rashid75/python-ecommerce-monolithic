@@ -33,9 +33,14 @@ def get_by_id(db: Session, product_id: int) -> Product | None:
 
 
 def get_by_sku(db: Session, sku: str) -> Product | None:
-    """Fetch one product by its SKU, or None."""
+    """Fetch one product by its SKU, or None. Case-insensitive.
+
+    Matches how uniqueness is enforced. A case-sensitive lookup here would
+    say "not found" for a SKU the database considers taken.
+    """
     # scalar() returns the first column of the first row, or None.
-    return db.scalar(select(Product).where(Product.sku == sku))
+    # func.lower on both sides lets the uq_products_lower_sku index be used.
+    return db.scalar(select(Product).where(func.lower(Product.sku) == sku.lower()))
 
 
 def _filters(

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, String, func
+from sqlalchemy import DateTime, Index, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -23,9 +23,10 @@ class Category(Base):
     # the value, so we never set id ourselves.
     id: Mapped[int] = mapped_column(primary_key=True)
 
-    # String(100) becomes VARCHAR(100). unique=True adds a constraint, so
-    # the database itself rejects a duplicate name even if our code misses it.
-    name: Mapped[str] = mapped_column(String(100), unique=True)
+    # Uniqueness is enforced by the case-insensitive index in __table_args__,
+    # not by unique=True here. unique=True would let "Books" and "books" both
+    # exist, which is a duplicate to everyone except the database.
+    name: Mapped[str] = mapped_column(String(100))
 
     # server_default=func.now() means PostgreSQL fills this in on INSERT.
     # timezone=True stores the offset, so times stay correct across regions.
@@ -41,4 +42,11 @@ class Category(Base):
     # the children alone and let the database decide.
     products: Mapped[list["Product"]] = relationship(
         back_populates="category", passive_deletes="all"
+    )
+
+    __table_args__ = (
+        # A unique index on lower(name), so Books / books / BOOKS collide.
+        # Given an explicit name because the naming convention cannot build
+        # one for an index on an expression rather than a plain column.
+        Index("uq_categories_lower_name", func.lower(name), unique=True),
     )

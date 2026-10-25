@@ -4,7 +4,16 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -19,8 +28,9 @@ class Product(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
 
     # Stock Keeping Unit: the shop's own code for this product.
-    # unique=True also creates an index, which makes lookups by sku fast.
-    sku: Mapped[str] = mapped_column(String(50), unique=True)
+    # Uniqueness comes from the case-insensitive index in __table_args__,
+    # so REL-1 and rel-1 are the same SKU.
+    sku: Mapped[str] = mapped_column(String(50))
 
     name: Mapped[str] = mapped_column(String(200))
 
@@ -63,4 +73,6 @@ class Product(Base):
         # The database refuses a negative price even if application code
         # somehow allows one. A safety net under the service layer.
         CheckConstraint("price >= 0", name="price_not_negative"),
+        # Unique on lower(sku), so REL-1 and rel-1 cannot both exist.
+        Index("uq_products_lower_sku", func.lower(sku), unique=True),
     )

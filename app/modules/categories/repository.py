@@ -13,7 +13,8 @@ def get_by_id(db: Session, category_id: int) -> Category | None:
 
 
 def get_by_name(db: Session, name: str) -> Category | None:
-    return db.scalar(select(Category).where(Category.name == name))
+    """Case-insensitive, matching how uniqueness is enforced."""
+    return db.scalar(select(Category).where(func.lower(Category.name) == name.lower()))
 
 
 def _filters(search: str | None) -> list[ColumnElement[bool]]:

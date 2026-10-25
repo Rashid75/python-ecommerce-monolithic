@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 22 — Relationship loading and N+1** (Steps 1–21 complete) |
-| **Phases complete** | 3 of 12 |
-| **Steps complete** | 21 of 74 |
+| **Current step** | **Step 24 — User model and migration** (Steps 1–23 complete, Phase 4 done) |
+| **Phases complete** | 4 of 12 |
+| **Steps complete** | 23 of 74 |
 
 ### Goals
 
@@ -196,8 +196,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 |---|---|---|
 | 20 | Implement categories | ✅ |
 | 21 | Product–category relationships | ✅ |
-| 22 | Explain FKs, relationship loading, lazy vs eager, N+1 | 🔵 |
-| 23 | Constraints and indexes | ⬜ |
+| 22 | Explain FKs, relationship loading, lazy vs eager, N+1 | ✅ |
+| 23 | Constraints and indexes | ✅ |
 
 ### Phase 5 — Users and Authentication
 
@@ -2029,6 +2029,129 @@ has to be tested through the application, not confirmed in `psql`. Verifying
   `is_active` exists and why deleting products outright becomes questionable then.
 - **Unchanged:** write endpoints remain unauthenticated until Step 30.
 - **Residual risk: Medium**, unchanged.
+
+---
+
+### ✅ Step 22 — Relationship Loading and N+1
+
+**Completed:** 2026-10-22 · Explanation step — **no production code changed**.
+
+Measured with a `before_cursor_execute` event listener counting real queries, inside a
+transaction that was rolled back. Five products, **each in its own category**.
+
+| Approach | Queries |
+|---|---|
+| Load 5 products | 1 |
+| …then read `p.category.name` on each (**default, lazy**) | **6** |
+| `selectinload(Product.category)` | **2** |
+| `joinedload(Product.category)` | **1** |
+
+The first run of this demo put all five products in **one** category and showed only 2
+queries, because SQLAlchemy found the already-loaded category in the session's identity map.
+That is genuinely useful behaviour, and it also means **a careless N+1 test can pass**.
+Distinct related rows are required to see the real cost.
+
+#### What each does
+
+- **Lazy (default).** The relationship is a placeholder; touching `p.category` fires a query
+  right then. Fine for one object, quadratic-feeling for a list: 100 products become 101
+  queries.
+- **`selectinload`.** Loads the parents, then issues one `SELECT ... WHERE id IN (...)` for
+  all related rows. Always 2 queries regardless of page size. The right default.
+- **`joinedload`.** One query with a `LEFT OUTER JOIN`. Best for many-to-one; for
+  one-to-many it multiplies rows (10 products × 5 items each = 50 rows to deduplicate) and
+  interacts badly with `LIMIT`.
+
+#### Guidance recorded for this project
+
+Use `selectinload` for collections and for any list endpoint. Use `joinedload` for a
+single many-to-one on a single object. Never rely on lazy loading inside a loop.
+
+Also relevant: `expire_on_commit=False` (Step 7) means attributes stay readable after
+commit. Without it, serialising a response after commit would trigger a refresh query per
+object — an N+1 that appears only in production under load.
+
+#### Not changed
+
+`ProductRead` still returns `category_id` only, so the API currently issues no extra
+queries. When a nested category object is added to the response, the list endpoint **must**
+add `selectinload(Product.category)` in the same change, or it becomes an N+1 the moment it
+ships.
+
+#### Risk & Controls Note
+
+No code or data changed; demo rows rolled back, verified 0 left. N+1 is an availability
+concern rather than a confidentiality one: a list endpoint issuing one query per row turns a
+normal request into a database load amplifier, which is a cheap denial-of-service lever when
+the endpoint is unauthenticated — as the product list currently is. The `limit` cap of 100
+bounds the damage to 101 queries per request rather than unbounded. Re-check at Step 64
+alongside index and connection-pool review. **Residual risk: Low** at current scale.
+
+---
+
+### ✅ Step 23 — Constraints and Indexes
+
+**Completed:** 2026-10-25 · **Phase 4 complete.** Migration to be run by the user.
+
+#### What already existed
+
+| Index | Source |
+|---|---|
+| `pk_categories`, `pk_products` | primary keys |
+| `uq_categories_name`, `uq_products_sku` | unique constraints |
+| `ix_products_category_id` | added explicitly in Step 21 |
+
+Every index so far came free from a constraint, except the foreign-key index — PostgreSQL
+does not create those automatically. Nothing was missing for *performance* at this scale,
+so no speculative indexes were added.
+
+#### The gap: uniqueness was case-sensitive
+
+Demonstrated against the live API, not assumed:
+
+```
+POST /categories {"name":"DRINKWARE"} -> 201
+POST /categories {"name":"drinkware"} -> 201
+list -> Drinkware, DRINKWARE, drinkware
+
+POST /products {"sku":"rel-1"} -> 201   (REL-1 already existed)
+```
+
+Three categories that are the same word, and two SKUs that are the same code. `unique=True`
+compares byte for byte, so these are distinct rows to PostgreSQL and duplicates to every
+human and every downstream system.
+
+#### The fix
+
+`unique=True` replaced with a **unique index on the lowercased column** on both tables:
+
+```python
+Index("uq_categories_lower_name", func.lower(name), unique=True)
+Index("uq_products_lower_sku", func.lower(sku), unique=True)
+```
+
+Explicit names, because the naming convention cannot build one for an index on an
+expression rather than a plain column.
+
+`get_by_sku` and `get_by_name` were changed to compare with `func.lower(...)` as well. Had
+they stayed case-sensitive, a lookup would report "not found" for a value the database
+considers taken — the lookup and the constraint must agree, and using `func.lower` on the
+column lets the new index serve the query.
+
+#### Risk & Controls Note
+
+- **Controls:** uniqueness that matches human meaning rather than byte equality. Duplicate
+  SKUs are a data-integrity problem with real downstream effects — two rows for one product
+  split stock, split reporting and make reconciliation ambiguous. Enforced in the database,
+  so it holds for imports, scripts and manual queries, not only the API.
+- **Operational note for Step 70:** this migration **adds a unique constraint to an existing
+  table**. If duplicates exist, the migration fails and the deployment stops. That is the
+  correct behaviour, and it is also why such a change needs the data checked first. The
+  duplicates created during the demonstration were removed before the model change.
+- **Deferred to Step 64:** trigram index for `search` (leading-wildcard `ILIKE` cannot use a
+  B-tree); indexes for sorting by `name`, `price` or `created_at` once query patterns are
+  known from real use rather than guessed.
+- **Residual risk: Low.**
 
 ---
 
