@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 25 — Registration and password hashing** (Steps 1–24 complete) |
+| **Current step** | **Step 26 — Login** (Steps 1–25 complete) |
 | **Phases complete** | 4 of 12 |
-| **Steps complete** | 24 of 74 |
+| **Steps complete** | 25 of 74 |
 
 ### Goals
 
@@ -204,8 +204,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | # | Step | Status |
 |---|---|---|
 | 24 | User model and migration | ✅ |
-| 25 | Registration and password hashing | 🔵 |
-| 26 | Login | ⬜ |
+| 25 | Registration and password hashing | ✅ |
+| 26 | Login | 🔵 |
 | 27 | Generate and validate JWT access tokens | ⬜ |
 | 28 | Current-user retrieval via FastAPI dependencies | ⬜ |
 | 29 | Protect endpoints with authentication | ⬜ |
@@ -2210,6 +2210,85 @@ Six columns with correct types and nullability, and one unique index on `lower(e
   rest for the database volume (Phase 12); a retention and deletion policy for user records,
   which PDPL requires and which Step 74 should cover.
 - **Residual risk: Low** today, since the table is empty and no endpoint writes to it.
+
+---
+
+### ✅ Step 25 — Registration and Password Hashing
+
+**Completed:** 2026-10-25
+
+`POST /api/v1/users` registers an account. Dependencies added: `pwdlib[argon2]` 0.3.1 and
+`pydantic[email]` (brings `email-validator` 2.3.0).
+
+| File | |
+|---|---|
+| `app/core/security.py` | **new** — `hash_password`, `verify_password` |
+| `app/modules/users/{schemas,repository,service,router}.py` | **new** |
+| `app/api/router.py` | includes the users router |
+
+#### Decisions
+
+**Argon2id via `PasswordHash.recommended()`.** Argon2 won the Password Hashing Competition
+and is deliberately slow and memory-hard, so guessing passwords from a stolen database is
+expensive. A general-purpose hash such as SHA-256 is far too fast to be safe here.
+
+**`max_length=128` on the password, not only `min_length`.** Argon2 cost rises with input
+size, so without a cap a very large password body is a cheap way to burn server CPU.
+
+**`EmailStr`** rejects malformed addresses before any code runs.
+
+**Uniqueness by `IntegrityError`, not check-then-insert** — consistent with products and
+categories, and race-free.
+
+**`UserRead` does not list `password_hash`.** That absence *is* the control. The field sits
+next to the others on the model and cannot reach a response because it was never named.
+
+#### Verification
+
+| Check | Result |
+|---|---|
+| `POST` valid registration | `{"id":1,"email":"test.user@example.com","is_active":true,...}` · **201** |
+| Response contains `password_hash` | **No** — four fields only |
+| Same email, different case | **409** — case-insensitive index works |
+| `email: "not-an-email"` | **422** before any code ran |
+| 5-character password | **422** |
+| **Stored value** | `$argon2id$v=19$m=65536,t=3,p=4$NxbXA1dJ...` |
+| Plaintext present in the row | **0 rows match** — not stored anywhere |
+| Same password hashed twice | **Different hashes** — each is independently salted |
+| Both verify correctly | `True True` |
+| Wrong password | `False` |
+
+The stored string carries the algorithm (`argon2id`), version, and cost parameters
+(`m=65536,t=3,p=4`) alongside the salt and digest. That is what makes cost settings
+upgradable later without invalidating existing hashes.
+
+#### Known trade-off, accepted deliberately
+
+Returning **409** on a duplicate email **confirms that an address is registered**, which
+allows user enumeration — someone can test whether a given person has an account here. The
+privacy-preserving alternative is to always return 201 and send a message to the address
+instead, which needs email delivery this project does not yet have.
+
+Accepted for now and recorded. Partial mitigation is rate limiting at Step 63. Revisit at
+Step 65 — under PDPL, confirming that a named individual holds an account is itself a
+disclosure of personal data.
+
+#### Risk & Controls Note
+
+- **Data:** one synthetic account (`test.user@example.com`). No real personal data.
+- **Controls implemented and tested:** Argon2id hashing with per-password salts, proven by
+  two identical passwords producing different hashes; plaintext confirmed absent from
+  storage; constant-time verification via the library, so timing does not reveal how much of
+  a password was correct; the plaintext exists only inside `register_user` and is never
+  logged; response allow-list proven to exclude the hash; bounded password length to limit
+  CPU cost.
+- **Open:** user enumeration via the 409, as above. No password-strength rule beyond length
+  — a deliberate choice, since length matters far more than composition rules, but a
+  breached-password check (for example a k-anonymity lookup) would be the stronger control
+  and is worth considering at Step 65.
+- **Deferred:** rate limiting and lockout (Step 63); authentication event logging (Step 60);
+  password reset; retention and deletion policy (Step 74).
+- **Residual risk: Low–Medium** — the hashing is sound; enumeration is the open item.
 
 ---
 
