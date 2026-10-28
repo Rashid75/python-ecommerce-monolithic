@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 31 — Auth concepts explained** (Steps 1–30 complete) |
-| **Phases complete** | 4 of 12 |
-| **Steps complete** | 30 of 74 |
+| **Current step** | **Step 33 — Stock adjustment and availability rules** (Steps 1–32 complete) |
+| **Phases complete** | 5 of 12 |
+| **Steps complete** | 32 of 74 |
 
 ### Goals
 
@@ -210,14 +210,14 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 28 | Current-user retrieval via FastAPI dependencies | ✅ |
 | 29 | Protect endpoints with authentication | ✅ |
 | 30 | Roles and permissions (customer / administrator) | ✅ |
-| 31 | Explain token expiration, password security, authN vs authZ, JWT mistakes | 🔵 |
+| 31 | Explain token expiration, password security, authN vs authZ, JWT mistakes | ✅ |
 
 ### Phase 6 — Inventory
 
 | # | Step | Status |
 |---|---|---|
-| 32 | Inventory and stock quantities | ⬜ |
-| 33 | Stock adjustment and availability rules | ⬜ |
+| 32 | Inventory and stock quantities | ✅ |
+| 33 | Stock adjustment and availability rules | 🔵 |
 | 34 | Prevent negative inventory, handle concurrent stock changes | ⬜ |
 | 35 | Explain transactions, row locking / conditional updates, race conditions | ⬜ |
 
@@ -2682,6 +2682,129 @@ it and add it by hand if absent. Same list as expression indexes.
   currently in the roadmap; rate limiting (Step 63).
 - **Residual risk: Low** for the catalogue; the open items are rate limiting and audit
   logging.
+
+---
+
+### ✅ Step 31 — Authentication Concepts
+
+**Completed:** 2026-10-28 · Explanation step — **no code added**. **Phase 5 complete.**
+
+#### Token expiry, watched in real time
+
+```
+token issued, valid for 4 seconds
+  t+0s  accepted (user 1)
+  t+3s  accepted (user 1)
+  t+4s  REJECTED - Invalid or expired token
+```
+
+Nothing was revoked and the server did not change its mind. The token stopped being valid at
+the time written inside it, which every holder of the token can read. **Expiry is the only
+limit a stateless token carries**, which is why 30 minutes rather than 30 days.
+
+#### Authentication versus authorisation
+
+| | Question | Status | Where |
+|---|---|---|---|
+| **Authentication** | Who are you? | 401 | `get_current_user` |
+| **Authorisation** | May you do this? | 403 | `require_admin` |
+
+Verified distinct in Step 30: no token → 401, customer token on a write → 403, admin token →
+201. Collapsing the two into one status is common and wrong — it tells a signed-in user to
+sign in again.
+
+#### Password security, as built
+
+| Control | Where |
+|---|---|
+| Argon2id, memory-hard, per-password salt | `app/core/security.py` |
+| Plaintext never stored or logged | `register_user` only |
+| Constant-time verification | library |
+| Length bounded 8–128 | `UserCreate` |
+| Hash absent from every response | `UserRead` field list |
+| Uniform failure message and timing | `authenticate_user` |
+
+#### JWT mistakes, and which were avoided
+
+| Mistake | Status |
+|---|---|
+| Trusting the token's own `alg` header (`alg=none`) | **avoided** — `algorithms=[...]` is server-chosen; proven rejected |
+| Personal data in the payload | **avoided** — `sub`, `iat`, `exp` only; payload is readable by anyone |
+| No expiry, or very long expiry | **avoided** — 30 minutes, bounded 1–1440 |
+| Default or weak signing secret | **avoided** — `SecretStr`, no default, 56 random characters |
+| Trusting the token alone for authorisation | **avoided** — user re-loaded from the database every request |
+| Different errors for different failures | **avoided** — one message everywhere |
+| Assuming a token can be revoked | **not avoided — accepted** |
+
+#### Honest gaps at the end of Phase 5
+
+1. **No rate limiting.** Login permits unlimited guessing; Argon2's ~68 ms is a speed bump,
+   not a control. Step 63, and worth pulling earlier.
+2. **No individual token revocation.** Disabling an *account* takes effect immediately
+   (Step 28), but one device cannot be signed out while the account stays active.
+3. **No refresh token.** Users re-authenticate every 30 minutes.
+4. **No authentication audit log.** Step 60. In a regulated context, failed sign-ins and
+   role changes are a required trail.
+5. **No MFA for administrators.** Not in the roadmap; expected in this sector.
+6. **User enumeration via the registration 409** (Step 25), still open.
+
+#### Risk & Controls Note
+
+No code or data changed. Phase 5 took the catalogue from fully open to admin-only with
+sound credential handling. The honest summary: **authentication and authorisation are
+correct; the operational controls around them are not yet built.** Items 1 and 4 above are
+the ones that would block a production review in this sector, and both have roadmap homes.
+**Residual risk: Medium** overall, driven by the absence of rate limiting and audit logging
+rather than by any defect in what exists.
+
+---
+
+### ✅ Step 32 — Stock Quantities
+
+**Completed:** 2026-10-28 · Phase 6 begins. Migration run by the user.
+
+`products.stock_quantity`, an integer defaulting to 0, with a check constraint
+`stock_quantity >= 0`.
+
+#### Decision: a column on products, not a separate inventory table
+
+There is one warehouse, no stock history to keep and no reservations. A separate table would
+add a join on every product read and a second row to lock during checkout, for no benefit
+today. **Deviation from the target structure's `modules/inventory/`, recorded deliberately** —
+it becomes justified the moment stock needs batches, locations, reservations or an audit
+trail of movements, and that is a schema change rather than a rewrite.
+
+#### Decision: `stock_quantity` is NOT on `ProductUpdate`
+
+Verified:
+
+```
+Create: [..., 'category_id', 'stock_quantity']
+Update: ['name', 'description', 'price', 'is_active', 'category_id']     <- absent
+Read  : [..., 'category_id', 'stock_quantity', ...]
+```
+
+Stock moves *because something happened* — a delivery arrived, a sale shipped, a count was
+corrected. A generic `PATCH {"stock_quantity": 5}` sets an absolute value, which silently
+overwrites whatever a concurrent sale just did: read 5, sell 1 elsewhere, write 5, and the
+sale has vanished. Explicit adjustment operations (Step 33) can be made atomic and recorded;
+an absolute setter cannot.
+
+Settable at creation as opening stock, readable always.
+
+#### Risk & Controls Note
+
+- **Controls:** a database-level floor at zero, which holds even if application arithmetic is
+  wrong — Step 34 is about ensuring it never has to. Stock deliberately excluded from the
+  generic update path, removing a lost-update race before it can be written.
+- **Migration note carried forward from Step 30:** Alembic autogenerate does **not** emit
+  `CheckConstraint`s. `ck_products_stock_not_negative` must be added to the migration by
+  hand if absent.
+- **Deferred:** stock movement history, which is what would answer "why is this figure
+  wrong" — worth considering at Step 64 if inventory disputes matter; audit logging of
+  adjustments (Step 60).
+- **Residual risk: Low** — no concurrency protection yet beyond the constraint, which is
+  exactly Step 34's subject.
 
 ---
 

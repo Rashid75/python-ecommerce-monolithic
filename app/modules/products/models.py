@@ -47,6 +47,13 @@ class Product(Base):
     # sense. server_default must be a SQL string, not a Python bool.
     is_active: Mapped[bool] = mapped_column(server_default="true")
 
+    # How many are on hand. A column on products rather than a separate
+    # inventory table: there is one warehouse and no stock history to keep,
+    # so a second table would add a join and a second row to lock for no
+    # benefit. Revisit if reservations, batches or multiple locations
+    # arrive - then stock genuinely becomes its own thing.
+    stock_quantity: Mapped[int] = mapped_column(server_default="0")
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # onupdate tells SQLAlchemy to refresh this whenever the row changes.
     updated_at: Mapped[datetime] = mapped_column(
@@ -73,6 +80,10 @@ class Product(Base):
         # The database refuses a negative price even if application code
         # somehow allows one. A safety net under the service layer.
         CheckConstraint("price >= 0", name="price_not_negative"),
+        # You cannot have minus three of something. This is the floor that
+        # holds even if a concurrent checkout gets the arithmetic wrong -
+        # Step 34 is about making sure it never has to.
+        CheckConstraint("stock_quantity >= 0", name="stock_not_negative"),
         # Unique on lower(sku), so REL-1 and rel-1 cannot both exist.
         Index("uq_products_lower_sku", func.lower(sku), unique=True),
     )

@@ -26,6 +26,9 @@ class ProductCreate(BaseModel):
     # Optional: a product can exist before it is filed under a category.
     # The service checks that the category actually exists.
     category_id: int | None = None
+    # Opening stock. Defaults to 0, so a product that is created without
+    # one simply cannot be sold until stock is added.
+    stock_quantity: int = Field(default=0, ge=0)
 
 
 class ProductUpdate(BaseModel):
@@ -40,6 +43,12 @@ class ProductUpdate(BaseModel):
     price: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
     is_active: bool | None = None
     category_id: int | None = None
+    # stock_quantity is absent on purpose. Stock moves because something
+    # happened - a delivery arrived, a sale shipped, a count was corrected -
+    # and those belong in explicit adjustment operations that can be made
+    # atomic and recorded. A generic PATCH that sets it to a number would
+    # overwrite whatever a concurrent sale just did. Step 33 adds the
+    # proper endpoints.
 
 
 class ProductRead(BaseModel):
@@ -56,6 +65,7 @@ class ProductRead(BaseModel):
     price: Decimal
     is_active: bool
     category_id: int | None
+    stock_quantity: int
     created_at: datetime
     updated_at: datetime
 
