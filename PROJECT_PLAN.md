@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 30 — Roles and permissions** (Steps 1–29 complete) |
+| **Current step** | **Step 31 — Auth concepts explained** (Steps 1–30 complete) |
 | **Phases complete** | 4 of 12 |
-| **Steps complete** | 29 of 74 |
+| **Steps complete** | 30 of 74 |
 
 ### Goals
 
@@ -209,8 +209,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 27 | Generate and validate JWT access tokens | ✅ |
 | 28 | Current-user retrieval via FastAPI dependencies | ✅ |
 | 29 | Protect endpoints with authentication | ✅ |
-| 30 | Roles and permissions (customer / administrator) | 🔵 |
-| 31 | Explain token expiration, password security, authN vs authZ, JWT mistakes | ⬜ |
+| 30 | Roles and permissions (customer / administrator) | ✅ |
+| 31 | Explain token expiration, password security, authN vs authZ, JWT mistakes | 🔵 |
 
 ### Phase 6 — Inventory
 
@@ -2587,6 +2587,101 @@ Test rows removed afterwards.
 - **Deferred, unchanged:** rate limiting (Step 63); authentication and write-event audit
   logging (Step 60) — once roles exist, "who changed this price" becomes a question the logs
   must answer.
+
+---
+
+### ✅ Step 30 — Roles and Permissions
+
+**Completed:** 2026-10-28 · Migration run by the user.
+
+`users.role` holds `customer` or `admin`. Product and category writes now require `admin`,
+not merely a signed-in user.
+
+#### The rule that matters
+
+**A role a client can choose is not a role.** `UserCreate` has exactly two fields — verified:
+
+```
+UserCreate fields: ['email', 'password']
+UserRead fields  : ['id', 'email', 'is_active', 'role', 'created_at']
+```
+
+There is no `role` field on the request schema to attack. `register_user` sets
+`role=ROLE_CUSTOMER` in code. Had the role been read from the request body, anyone could
+register as an administrator — a complete privilege escalation from an unauthenticated
+request, and a common real-world defect.
+
+`role` is readable on `UserRead` so a client knows what it may do, and settable nowhere.
+
+#### 401 versus 403
+
+| Code | Meaning | Retry? |
+|---|---|---|
+| **401** | I do not know who you are | Sign in and try again |
+| **403** | I know who you are, and you still may not | Pointless with the same account |
+
+`require_admin` returns **403**. Returning 401 would tell an administrator to sign in again
+when they already had.
+
+#### Other decisions
+
+**A `String(20)` with a check constraint, not a PostgreSQL `ENUM` type.** Adding a third
+role later is then an ordinary constraint change rather than `ALTER TYPE`, which is awkward
+inside a transaction. The constraint means a typo in a manual `UPDATE` cannot leave an
+account in a state the code does not understand.
+
+**`server_default="customer"`**, so existing rows get the least-privileged value when the
+migration runs. Defaulting to `admin` would have promoted every existing account.
+
+**No API to change a role.** Promotion is a deliberate database action by an administrator.
+An endpoint for it would need careful authorisation of its own and is not needed yet.
+
+#### Defect found: autogenerate silently dropped the check constraint
+
+The generated migration contained only `op.add_column`. **Alembic's autogenerate compares
+tables, columns, indexes and foreign keys, but not `CheckConstraint`s** — a documented
+limitation, not a bug. The model declared the constraint, the migration omitted it with no
+warning, and the database accepted `role='superuser'`.
+
+Caught by attempting an invalid write rather than by reading the model. Same lesson as
+Step 21 in a different disguise: a correct model does not mean a correct database.
+
+Fixed with a hand-written migration `b7c41d9e2a38`, which repairs any offending row **before**
+adding the constraint — adding a constraint to data that violates it simply fails.
+
+**Rule recorded:** when a model gains a `CheckConstraint`, check the generated migration for
+it and add it by hand if absent. Same list as expression indexes.
+
+#### Verification — after the fix
+
+| Check | Result |
+|---|---|
+| `ck_users_role_is_known` present | yes |
+| `UPDATE users SET role='superuser'` | **rejected** by the constraint |
+| New registration's role | `customer` |
+| Promoted account's role | `admin` |
+| **Customer token** on `POST`/`PATCH`/`DELETE /products`, `POST /categories` | **403** on all four |
+| Customer token on `GET /products`, `GET /users/me` | **200** |
+| **Admin token** on `POST /products`, `POST /categories` | **201** |
+| **No token** on `POST /products` | **401**, not 403 — the distinction holds |
+
+#### Risk & Controls Note
+
+- **This closes the privilege gap left open by Step 29.** Writes are no longer available to
+  any registered user; open registration no longer grants catalogue write access.
+- **Controls:** role settable only server-side, verified by the absence of the field on the
+  request schema rather than by validation that could be bypassed; least-privilege default
+  on both new and existing rows; database-level constraint on permitted values; correct
+  status-code semantics.
+- **Operational note:** the first administrator must be created with a direct `UPDATE`.
+  That is appropriate — bootstrapping an administrator through an API is how bootstrap
+  endpoints get left enabled in production.
+- **Deferred:** audit logging of role changes and of catalogue writes (Step 60) — in a
+  regulated context, who promoted an account and who changed a price are both questions the
+  logs must answer; MFA for administrative accounts, expected in this sector and not
+  currently in the roadmap; rate limiting (Step 63).
+- **Residual risk: Low** for the catalogue; the open items are rate limiting and audit
+  logging.
 
 ---
 

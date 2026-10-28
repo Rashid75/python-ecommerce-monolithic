@@ -51,4 +51,9 @@ class UserRead(BaseModel):
     id: int
     email: str
     is_active: bool
+    # Shown so a client knows what it may do. Readable, never settable:
+    # UserCreate has no role field, so a registration request cannot ask
+    # for one. Accepting it from the body would be instant privilege
+    # escalation - anyone could register as an administrator.
+    role: str
     created_at: datetime

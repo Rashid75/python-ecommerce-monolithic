@@ -15,7 +15,7 @@ from app.core.exceptions import AlreadyExistsError, NotFoundError
 from app.db.session import DbSession
 from app.modules.products import service
 from app.modules.products.schemas import ProductCreate, ProductRead, ProductUpdate
-from app.modules.users.dependencies import get_current_user
+from app.modules.users.dependencies import require_admin
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -23,7 +23,7 @@ router = APIRouter(prefix="/products", tags=["products"])
 # without passing the user into the function, which is what we want here:
 # the endpoint needs the request to be authenticated, but does not use who
 # it was. Reading products stays open, because a shop catalogue is public.
-requires_auth = [Depends(get_current_user)]
+requires_admin = [Depends(require_admin)]
 
 
 @router.get("", summary="List products")
@@ -80,7 +80,7 @@ def get_product(product_id: int, db: DbSession) -> ProductRead:
     "",
     status_code=status.HTTP_201_CREATED,
     summary="Create a product",
-    dependencies=requires_auth,
+    dependencies=requires_admin,
 )
 def create_product(data: ProductCreate, db: DbSession) -> ProductRead:
     try:
@@ -96,7 +96,7 @@ def create_product(data: ProductCreate, db: DbSession) -> ProductRead:
 
 # PATCH, not PUT: the client sends only the fields it wants to change.
 # PUT would mean "replace the whole product with this".
-@router.patch("/{product_id}", summary="Update a product", dependencies=requires_auth)
+@router.patch("/{product_id}", summary="Update a product", dependencies=requires_admin)
 def update_product(product_id: int, data: ProductUpdate, db: DbSession) -> ProductRead:
     try:
         return service.update_product(db, product_id, data)
@@ -109,7 +109,7 @@ def update_product(product_id: int, data: ProductUpdate, db: DbSession) -> Produ
     "/{product_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a product",
-    dependencies=requires_auth,
+    dependencies=requires_admin,
 )
 def delete_product(product_id: int, db: DbSession) -> None:
     try:

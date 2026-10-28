@@ -9,12 +9,12 @@ from app.core.exceptions import AlreadyExistsError, InUseError, NotFoundError
 from app.db.session import DbSession
 from app.modules.categories import service
 from app.modules.categories.schemas import CategoryCreate, CategoryRead, CategoryUpdate
-from app.modules.users.dependencies import get_current_user
+from app.modules.users.dependencies import require_admin
 
 router = APIRouter(prefix="/categories", tags=["categories"])
 
-# Writes need a signed-in user; reading the category list stays open.
-requires_auth = [Depends(get_current_user)]
+# Writes are administrator-only; reading the category list stays open.
+requires_admin = [Depends(require_admin)]
 
 
 @router.get("", summary="List categories")
@@ -45,7 +45,7 @@ def get_category(category_id: int, db: DbSession) -> CategoryRead:
     "",
     status_code=status.HTTP_201_CREATED,
     summary="Create a category",
-    dependencies=requires_auth,
+    dependencies=requires_admin,
 )
 def create_category(data: CategoryCreate, db: DbSession) -> CategoryRead:
     try:
@@ -54,7 +54,7 @@ def create_category(data: CategoryCreate, db: DbSession) -> CategoryRead:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
-@router.patch("/{category_id}", summary="Update a category", dependencies=requires_auth)
+@router.patch("/{category_id}", summary="Update a category", dependencies=requires_admin)
 def update_category(category_id: int, data: CategoryUpdate, db: DbSession) -> CategoryRead:
     try:
         return service.update_category(db, category_id, data)
@@ -68,7 +68,7 @@ def update_category(category_id: int, data: CategoryUpdate, db: DbSession) -> Ca
     "/{category_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a category",
-    dependencies=requires_auth,
+    dependencies=requires_admin,
 )
 def delete_category(category_id: int, db: DbSession) -> None:
     try:

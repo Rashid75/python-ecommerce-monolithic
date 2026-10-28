@@ -12,7 +12,7 @@ from app.core.exceptions import AuthenticationError
 from app.core.security import decode_access_token
 from app.db.session import DbSession
 from app.modules.users import repository as repo
-from app.modules.users.models import User
+from app.modules.users.models import ROLE_ADMIN, User
 
 # Reads the Authorization: Bearer <token> header. auto_error=False so a
 # missing header reaches our code: FastAPI's built-in error for this is a
@@ -60,3 +60,24 @@ def get_current_user(
 
 # Lets an endpoint write `user: CurrentUser` and be protected by it.
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def require_admin(user: CurrentUser) -> User:
+    """Allow only administrators through.
+
+    401 and 403 are different answers. 401 means "I do not know who you
+    are" - sign in and try again. 403 means "I know exactly who you are and
+    you still may not do this", so retrying with the same account is
+    pointless. Returning 401 here would tell an administrator to sign in
+    again when they already had.
+    """
+    if user.role != ROLE_ADMIN:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Administrator access required",
+        )
+    return user
+
+
+# For an endpoint that needs the administrator object.
+AdminUser = Annotated[User, Depends(require_admin)]

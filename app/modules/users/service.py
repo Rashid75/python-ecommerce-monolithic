@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import AlreadyExistsError, AuthenticationError, NotFoundError
 from app.core.security import hash_password, verify_password
 from app.modules.users import repository as repo
-from app.modules.users.models import User
+from app.modules.users.models import ROLE_CUSTOMER, User
 from app.modules.users.schemas import UserCreate
 
 # One message for every failure. See AuthenticationError.
@@ -32,6 +32,9 @@ def register_user(db: Session, data: UserCreate) -> User:
         email=data.email,
         # The plaintext goes no further than this line.
         password_hash=hash_password(data.password),
+        # Always a customer. Set here rather than taken from the request,
+        # because a role a client can choose is not a role.
+        role=ROLE_CUSTOMER,
     )
     try:
         repo.add(db, user)
