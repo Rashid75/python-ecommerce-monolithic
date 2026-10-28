@@ -2,15 +2,19 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.common.schemas import Page
 from app.core.exceptions import AlreadyExistsError, InUseError, NotFoundError
 from app.db.session import DbSession
 from app.modules.categories import service
 from app.modules.categories.schemas import CategoryCreate, CategoryRead, CategoryUpdate
+from app.modules.users.dependencies import get_current_user
 
 router = APIRouter(prefix="/categories", tags=["categories"])
+
+# Writes need a signed-in user; reading the category list stays open.
+requires_auth = [Depends(get_current_user)]
 
 
 @router.get("", summary="List categories")
@@ -37,7 +41,12 @@ def get_category(category_id: int, db: DbSession) -> CategoryRead:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, summary="Create a category")
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a category",
+    dependencies=requires_auth,
+)
 def create_category(data: CategoryCreate, db: DbSession) -> CategoryRead:
     try:
         return service.create_category(db, data)
@@ -45,7 +54,7 @@ def create_category(data: CategoryCreate, db: DbSession) -> CategoryRead:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
-@router.patch("/{category_id}", summary="Update a category")
+@router.patch("/{category_id}", summary="Update a category", dependencies=requires_auth)
 def update_category(category_id: int, data: CategoryUpdate, db: DbSession) -> CategoryRead:
     try:
         return service.update_category(db, category_id, data)
@@ -56,7 +65,10 @@ def update_category(category_id: int, data: CategoryUpdate, db: DbSession) -> Ca
 
 
 @router.delete(
-    "/{category_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete a category"
+    "/{category_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a category",
+    dependencies=requires_auth,
 )
 def delete_category(category_id: int, db: DbSession) -> None:
     try:

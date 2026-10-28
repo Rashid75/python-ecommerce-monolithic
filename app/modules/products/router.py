@@ -8,15 +8,22 @@ and no database queries live here.
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.common.schemas import Page
 from app.core.exceptions import AlreadyExistsError, NotFoundError
 from app.db.session import DbSession
 from app.modules.products import service
 from app.modules.products.schemas import ProductCreate, ProductRead, ProductUpdate
+from app.modules.users.dependencies import get_current_user
 
 router = APIRouter(prefix="/products", tags=["products"])
+
+# Attached to the write endpoints below. dependencies=[...] runs the check
+# without passing the user into the function, which is what we want here:
+# the endpoint needs the request to be authenticated, but does not use who
+# it was. Reading products stays open, because a shop catalogue is public.
+requires_auth = [Depends(get_current_user)]
 
 
 @router.get("", summary="List products")
@@ -69,7 +76,12 @@ def get_product(product_id: int, db: DbSession) -> ProductRead:
 
 # 201 Created is the correct status for a POST that makes a new thing.
 # FastAPI would otherwise return 200.
-@router.post("", status_code=status.HTTP_201_CREATED, summary="Create a product")
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a product",
+    dependencies=requires_auth,
+)
 def create_product(data: ProductCreate, db: DbSession) -> ProductRead:
     try:
         return service.create_product(db, data)
@@ -84,7 +96,7 @@ def create_product(data: ProductCreate, db: DbSession) -> ProductRead:
 
 # PATCH, not PUT: the client sends only the fields it wants to change.
 # PUT would mean "replace the whole product with this".
-@router.patch("/{product_id}", summary="Update a product")
+@router.patch("/{product_id}", summary="Update a product", dependencies=requires_auth)
 def update_product(product_id: int, data: ProductUpdate, db: DbSession) -> ProductRead:
     try:
         return service.update_product(db, product_id, data)
@@ -93,7 +105,12 @@ def update_product(product_id: int, data: ProductUpdate, db: DbSession) -> Produ
 
 
 # 204 No Content: it worked and there is nothing to send back.
-@router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete a product")
+@router.delete(
+    "/{product_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a product",
+    dependencies=requires_auth,
+)
 def delete_product(product_id: int, db: DbSession) -> None:
     try:
         service.delete_product(db, product_id)

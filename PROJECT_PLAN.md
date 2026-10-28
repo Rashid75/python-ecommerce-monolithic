@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 29 — Protect endpoints** (Steps 1–28 complete) |
+| **Current step** | **Step 30 — Roles and permissions** (Steps 1–29 complete) |
 | **Phases complete** | 4 of 12 |
-| **Steps complete** | 28 of 74 |
+| **Steps complete** | 29 of 74 |
 
 ### Goals
 
@@ -208,8 +208,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 26 | Login | ✅ |
 | 27 | Generate and validate JWT access tokens | ✅ |
 | 28 | Current-user retrieval via FastAPI dependencies | ✅ |
-| 29 | Protect endpoints with authentication | 🔵 |
-| 30 | Roles and permissions (customer / administrator) | ⬜ |
+| 29 | Protect endpoints with authentication | ✅ |
+| 30 | Roles and permissions (customer / administrator) | 🔵 |
 | 31 | Explain token expiration, password security, authN vs authZ, JWT mistakes | ⬜ |
 
 ### Phase 6 — Inventory
@@ -2520,6 +2520,73 @@ sessions.
 - **Residual risk: Medium**, unchanged — the remaining items are rate limiting and
   fine-grained revocation. Note that product and category writes are **still unauthenticated**
   until Step 29 applies this dependency to them.
+
+---
+
+### ✅ Step 29 — Protect the Write Endpoints
+
+**Completed:** 2026-10-28 · **Closes the gap open since Step 17.**
+
+Write endpoints on products and categories now require a signed-in user. Reads stay public,
+because a shop catalogue is public.
+
+```python
+requires_auth = [Depends(get_current_user)]
+
+@router.post("", status_code=201, dependencies=requires_auth)
+```
+
+`dependencies=[...]` rather than a `user: CurrentUser` parameter: the endpoint needs the
+request to be authenticated but does not use *who* it was, so an unused parameter would be
+noise. The dependency still runs and still rejects.
+
+#### Authorisation map, read from the generated OpenAPI document
+
+| Endpoint | |
+|---|---|
+| `GET /products`, `/products/{id}` | public |
+| `POST`, `PATCH`, `DELETE /products` | **AUTH** |
+| `GET /categories`, `/categories/{id}` | public |
+| `POST`, `PATCH`, `DELETE /categories` | **AUTH** |
+| `GET /users/me` | **AUTH** |
+| `POST /users` (register), `POST /auth/login` | public — necessarily |
+| `/health`, `/health/ready` | public |
+
+Reading it from the OpenAPI document rather than from the source is deliberate: it reflects
+what the running application actually enforces, so an endpoint accidentally left open shows
+up in the list.
+
+#### Verification
+
+| Request | Result |
+|---|---|
+| `GET /products`, `/products/16`, `/categories` without a token | **200** — still public |
+| `POST /products` without a token | **401** |
+| `PATCH /products/16` without a token | **401** |
+| `DELETE /products/16` without a token | **401** |
+| `POST /categories` without a token | **401** |
+| `DELETE /categories/2` without a token | **401** |
+| `POST /products` **with** a valid token | **201** |
+| `POST /categories` **with** a valid token | **201** |
+
+Test rows removed afterwards.
+
+#### Risk & Controls Note
+
+- **The material gap recorded at Steps 16, 17, 20 and 21 is now closed.** Product and
+  category data, including prices, can no longer be created, altered or deleted by an
+  unauthenticated caller.
+- **Residual risk drops from Medium to Low–Medium**, and the remaining concern changes
+  character: writes are now limited to *authenticated* users, but **any** registered user can
+  still change prices and delete products, because registration is open and there are no
+  roles yet. That is a privilege problem, not an authentication one, and **Step 30 is
+  required before this is deployable**.
+- **Controls:** fail-closed by default — the dependency rejects before the handler runs, so
+  a bug in the handler cannot expose the operation; authorisation state verified from the
+  running application's OpenAPI document rather than from source.
+- **Deferred, unchanged:** rate limiting (Step 63); authentication and write-event audit
+  logging (Step 60) — once roles exist, "who changed this price" becomes a question the logs
+  must answer.
 
 ---
 
