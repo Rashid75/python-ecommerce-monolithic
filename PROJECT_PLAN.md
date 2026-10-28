@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 28 — Current-user dependency** (Steps 1–27 complete) |
+| **Current step** | **Step 29 — Protect endpoints** (Steps 1–28 complete) |
 | **Phases complete** | 4 of 12 |
-| **Steps complete** | 27 of 74 |
+| **Steps complete** | 28 of 74 |
 
 ### Goals
 
@@ -207,8 +207,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 25 | Registration and password hashing | ✅ |
 | 26 | Login | ✅ |
 | 27 | Generate and validate JWT access tokens | ✅ |
-| 28 | Current-user retrieval via FastAPI dependencies | 🔵 |
-| 29 | Protect endpoints with authentication | ⬜ |
+| 28 | Current-user retrieval via FastAPI dependencies | ✅ |
+| 29 | Protect endpoints with authentication | 🔵 |
 | 30 | Roles and permissions (customer / administrator) | ⬜ |
 | 31 | Explain token expiration, password security, authN vs authZ, JWT mistakes | ⬜ |
 
@@ -2440,6 +2440,86 @@ trivial, and the signature is the only reason it fails.
   event logging (Step 60).
 - **Residual risk: Medium** — token handling is correct; revocation and rate limiting are
   the open items.
+
+---
+
+### ✅ Step 28 — Current-User Dependency
+
+**Completed:** 2026-10-28
+
+`app/modules/users/dependencies.py` turns `Authorization: Bearer <token>` into a `User`.
+Any module needing a signed-in user imports `CurrentUser` from there. `GET /users/me` added
+to demonstrate it.
+
+```python
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+@router.get("/me")
+def read_me(user: CurrentUser) -> UserRead:
+    return user
+```
+
+#### Decisions
+
+**`HTTPBearer(auto_error=False)`.** With `auto_error=True`, a missing header produces
+FastAPI's built-in **403**, and "you did not sign in" is a **401**. Handling it ourselves
+also keeps the message uniform.
+
+**One message for every cause.** Missing header, malformed token, expired token, wrong
+scheme, deleted or disabled account all return `401 {"detail":"Not authenticated"}`. A
+caller should not be able to tell an expired token from a disabled account.
+
+**`WWW-Authenticate: Bearer` on every 401**, which is what the HTTP spec requires of a 401
+and tells a client which scheme to retry with.
+
+**The user is looked up on every request**, rather than trusting the token alone. This is
+the important one: the token proves *who signed in*, the database decides *whether that
+account may still act*.
+
+#### The revocation gap, partly closed
+
+Step 27 recorded that tokens cannot be revoked. The database lookup narrows that
+considerably — demonstrated end to end:
+
+| Step | Result |
+|---|---|
+| `GET /users/me` with a valid token | **200** |
+| `UPDATE users SET is_active = false WHERE id = 1` | `UPDATE 1` |
+| **The same token, immediately after** | **401** |
+| Signing in again | **401**, generic message |
+| Re-enabled, same token | **200** again |
+
+So disabling an account takes effect on the **next request**, not when the token expires.
+What remains unrevocable is a token for an account that is still active — logging out
+elsewhere, or invalidating one device, would still need a token blacklist or server-side
+sessions.
+
+#### Verification
+
+| Request | Result |
+|---|---|
+| Valid token | `{"id":1,...}` · **200** |
+| No `Authorization` header | `Not authenticated` · **401** |
+| `Bearer not-a-real-token` | identical · **401** |
+| `Basic <valid token>` | identical · **401** — wrong scheme, not accepted |
+| 401 headers | `www-authenticate: Bearer` present |
+
+#### Risk & Controls Note
+
+- **Controls implemented and tested:** per-request authorisation check against the database,
+  giving near-immediate effect to account deactivation — the practical answer to the
+  stateless-token revocation problem at this scale, and an important one in a regulated
+  context where disabling access must be prompt; uniform 401 across all causes; correct
+  status code and `WWW-Authenticate` header; the bearer scheme enforced rather than any
+  credential being accepted.
+- **Cost accepted:** one extra database query per authenticated request. Correct trade —
+  the query is a primary-key lookup, and the alternative is accepting requests from accounts
+  that have been disabled.
+- **Still open:** individual token revocation while an account stays active; no rate
+  limiting (Step 63); no authentication event logging (Step 60).
+- **Residual risk: Medium**, unchanged — the remaining items are rate limiting and
+  fine-grained revocation. Note that product and category writes are **still unauthenticated**
+  until Step 29 applies this dependency to them.
 
 ---
 
