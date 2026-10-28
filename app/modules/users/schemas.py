@@ -18,6 +18,18 @@ class UserCreate(BaseModel):
     password: str = Field(min_length=8, max_length=128)
 
 
+class LoginRequest(BaseModel):
+    """Sign-in request.
+
+    No length rules on the password here. The stored one was checked at
+    registration, and rejecting a short attempt with 422 instead of 401
+    would quietly leak that the real password is longer than that.
+    """
+
+    email: EmailStr
+    password: str
+
+
 class UserRead(BaseModel):
     """What the API sends back about a user.
 

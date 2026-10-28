@@ -18,6 +18,15 @@ class AlreadyExistsError(AppError):
     """Something unique already uses that value. The router maps this to 409."""
 
 
+class AuthenticationError(AppError):
+    """Sign-in failed. The router maps this to 401.
+
+    Deliberately carries one message for every cause - unknown email, wrong
+    password, disabled account. Saying which one was wrong would let someone
+    discover who has an account here.
+    """
+
+
 class InUseError(AppError):
     """Something else still refers to this, so it cannot be removed.
 

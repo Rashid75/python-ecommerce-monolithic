@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 26 — Login** (Steps 1–25 complete) |
+| **Current step** | **Step 27 — JWT access tokens** (Steps 1–26 complete) |
 | **Phases complete** | 4 of 12 |
-| **Steps complete** | 25 of 74 |
+| **Steps complete** | 26 of 74 |
 
 ### Goals
 
@@ -205,8 +205,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 |---|---|---|
 | 24 | User model and migration | ✅ |
 | 25 | Registration and password hashing | ✅ |
-| 26 | Login | 🔵 |
-| 27 | Generate and validate JWT access tokens | ⬜ |
+| 26 | Login | ✅ |
+| 27 | Generate and validate JWT access tokens | 🔵 |
 | 28 | Current-user retrieval via FastAPI dependencies | ⬜ |
 | 29 | Protect endpoints with authentication | ⬜ |
 | 30 | Roles and permissions (customer / administrator) | ⬜ |
@@ -2289,6 +2289,83 @@ disclosure of personal data.
 - **Deferred:** rate limiting and lockout (Step 63); authentication event logging (Step 60);
   password reset; retention and deletion policy (Step 74).
 - **Residual risk: Low–Medium** — the hashing is sound; enumeration is the open item.
+
+---
+
+### ✅ Step 26 — Login
+
+**Completed:** 2026-10-27
+
+`POST /api/v1/auth/login` verifies credentials. The response is a `UserRead` for now;
+Step 27 replaces it with an access token, keeping this step to one idea — verifying a
+password safely.
+
+| File | |
+|---|---|
+| `app/core/exceptions.py` | `AuthenticationError` added (→ 401) |
+| `app/modules/users/service.py` | `authenticate_user` |
+| `app/modules/users/schemas.py` | `LoginRequest` |
+| `app/modules/users/auth_router.py` | **new** — `POST /auth/login` |
+
+#### Decisions
+
+**One message for every failure.** Unknown email, wrong password and disabled account all
+raise `AuthenticationError("Incorrect email or password")`. Distinguishing them would confirm
+which addresses have accounts — the same enumeration problem as the registration 409, in a
+more sensitive place.
+
+**No length rules on `LoginRequest.password`.** Rejecting a short attempt with 422 instead
+of 401 would leak that the real password is longer than that.
+
+**A dummy hash for the unknown-email path.** Argon2 is deliberately slow (~68 ms here). If
+an unknown email returned without hashing, it would answer in ~1 ms and the response time
+alone would reveal which addresses are registered. `authenticate_user` verifies against
+`_DUMMY_HASH` before failing, so both paths do the same work.
+
+**A separate `auth_router`**, because signing in is an action on credentials rather than
+creating or reading a user resource.
+
+#### Verification
+
+| Request | Result |
+|---|---|
+| Correct credentials | `{"id":1,"email":"test.user@example.com",...}` · **200** |
+| Right email, wrong password | `{"detail":"Incorrect email or password"}` · **401** |
+| Unknown email | **identical** body and status · **401** |
+| Email in different case | **200** — case-insensitive lookup matches the index |
+
+**Timing, 15 interleaved samples each after warm-up:**
+
+| Path | Median |
+|---|---|
+| Existing email, wrong password | 67.6 ms |
+| Unknown email | 68.4 ms |
+| **Difference** | **0.7 ms** |
+
+A first attempt measured 68.7 ms vs 94.5 ms and looked like a leak. That run tested the two
+groups sequentially with no warm-up, so the second absorbed start-up costs. Interleaving and
+discarding warm-up requests removed the artefact. **Worth recording as method:** a timing
+measurement without interleaving and warm-up produces confident nonsense in either
+direction.
+
+#### Risk & Controls Note
+
+- **Data:** one synthetic account.
+- **Controls implemented and tested:** uniform failure response across all three causes,
+  verified byte-identical; uniform response *time*, verified to 0.7 ms; constant-time hash
+  comparison from the library; disabled accounts rejected without being distinguishable.
+  Together these close the credential-side enumeration channel — though the registration
+  409 from Step 25 still leaks the same information by a different route, so the pair should
+  be resolved together at Step 65.
+- **Open and material:** there is **no rate limiting**, so this endpoint currently permits
+  unlimited password guessing. Argon2's ~68 ms cost is a weak throttle, not a control. This
+  must be closed before any shared environment — Step 63, and worth pulling earlier.
+  Account lockout or progressive delay should be considered alongside it.
+- **Deferred:** authentication event logging, successes and failures with source IP
+  (Step 60) — required as an audit trail in a regulated context; refresh tokens and session
+  revocation (Step 27+); MFA, not currently in the roadmap but expected for administrative
+  accounts in this sector.
+- **Residual risk: Medium** — the verification logic is sound; unlimited guessing is not.
 
 ---
 
