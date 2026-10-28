@@ -30,6 +30,14 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class TokenResponse(BaseModel):
+    """What a successful sign-in returns."""
+
+    access_token: str
+    # "bearer" tells the client to send it as: Authorization: Bearer <token>
+    token_type: str = "bearer"
+
+
 class UserRead(BaseModel):
     """What the API sends back about a user.
 

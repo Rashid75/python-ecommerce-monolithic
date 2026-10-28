@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Literal
 from urllib.parse import quote_plus
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +36,17 @@ class Settings(BaseSettings):
     db_password: SecretStr
     # Print every SQL statement. Handy while learning.
     db_echo: bool = False
+
+    # --- Authentication ---
+    # No default, for the same reason as the database password: a default
+    # secret is one an attacker already knows, and defaults get deployed.
+    # Anyone holding this value can mint a token for any account.
+    jwt_secret: SecretStr
+    # HS256 signs with this one shared secret. Fine for a single service.
+    jwt_algorithm: str = "HS256"
+    # Short-lived on purpose. A stolen token stays usable until it expires,
+    # and nothing here can revoke one early.
+    jwt_expire_minutes: int = Field(default=30, ge=1, le=1440)
 
     @property
     def is_production(self) -> bool:

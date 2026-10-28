@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 27 — JWT access tokens** (Steps 1–26 complete) |
+| **Current step** | **Step 28 — Current-user dependency** (Steps 1–27 complete) |
 | **Phases complete** | 4 of 12 |
-| **Steps complete** | 26 of 74 |
+| **Steps complete** | 27 of 74 |
 
 ### Goals
 
@@ -206,8 +206,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 24 | User model and migration | ✅ |
 | 25 | Registration and password hashing | ✅ |
 | 26 | Login | ✅ |
-| 27 | Generate and validate JWT access tokens | 🔵 |
-| 28 | Current-user retrieval via FastAPI dependencies | ⬜ |
+| 27 | Generate and validate JWT access tokens | ✅ |
+| 28 | Current-user retrieval via FastAPI dependencies | 🔵 |
 | 29 | Protect endpoints with authentication | ⬜ |
 | 30 | Roles and permissions (customer / administrator) | ⬜ |
 | 31 | Explain token expiration, password security, authN vs authZ, JWT mistakes | ⬜ |
@@ -2366,6 +2366,80 @@ direction.
   revocation (Step 27+); MFA, not currently in the roadmap but expected for administrative
   accounts in this sector.
 - **Residual risk: Medium** — the verification logic is sound; unlimited guessing is not.
+
+---
+
+### ✅ Step 27 — JWT Access Tokens
+
+**Completed:** 2026-10-28 · PyJWT 2.15.1.
+
+`POST /auth/login` now returns `{access_token, token_type}`. Token creation and validation
+live in `app/core/security.py`; three settings were added.
+
+| Setting | |
+|---|---|
+| `APP_JWT_SECRET` | `SecretStr`, **no default** |
+| `APP_JWT_ALGORITHM` | `HS256` |
+| `APP_JWT_EXPIRE_MINUTES` | 30, bounded 1–1440 |
+
+#### Decisions
+
+**No default for the secret**, for the same reason as the database password. Anyone holding
+it can mint a token for any account, so a default is a key an attacker already has, and
+defaults get deployed. A 56-character random value was generated for `.env`;
+`.env.example` carries `CHANGE_ME` and a generator command.
+
+**The payload carries only `sub`, `iat` and `exp`.** A JWT is **signed, not encrypted** —
+the payload is base64, readable by anyone holding the token. No email, no name, nothing
+private.
+
+**`algorithms=[...]` is a list we choose**, never the `alg` named inside the token. Trusting
+the token's own header is the classic JWT flaw: an attacker sets `alg` to `none` and the
+signature stops being checked.
+
+**30-minute expiry.** A stolen token works until it expires and nothing here can revoke one
+early — that is what refresh tokens and a revocation list would add.
+
+**Every decode failure raises one `AuthenticationError`**, so a client cannot learn whether
+a token was expired, forged, or malformed.
+
+#### Verification
+
+| Check | Result |
+|---|---|
+| Login | `token_type: bearer`, `eyJhbGciOiJIUzI1NiIs...` |
+| Wrong password | still **401**, no token |
+| **Payload read without the secret** | `{'sub': '1', 'iat': ..., 'exp': ...}` — readable, as expected |
+| Valid token decodes | `1` |
+| Signature altered | rejected |
+| `sub` changed to `999`, old signature | rejected |
+| **`alg=none` unsigned token** | **rejected** |
+| Expired token | rejected |
+| Token signed with a different secret | rejected |
+| `create_access_token(42)` → decode | `42` |
+
+The forged-subject case is the one that matters: changing `sub` from `1` to `999` is
+trivial, and the signature is the only reason it fails.
+
+#### Risk & Controls Note
+
+- **Controls implemented and tested:** signing secret held as `SecretStr` with no default
+  and excluded from serialisation, like the database password; a fixed server-side algorithm
+  list, with `alg=none` proven rejected; expiry enforced and bounded; no personal data in
+  the payload, which matters because the token is readable by anyone who obtains it and may
+  sit in browser storage or proxy logs; uniform decode failure.
+- **Accepted limitations, recorded:** tokens **cannot be revoked** before expiry — sign-out
+  is client-side only, and a disabled account keeps working until its token lapses. For
+  administrative accounts in this sector that gap needs closing, via short expiry plus a
+  revocation check or server-side sessions. No refresh token, so users re-authenticate every
+  30 minutes.
+- **Open and material, unchanged:** no rate limiting on login (Step 63), so tokens can be
+  pursued by unlimited password guessing.
+- **Deferred:** key rotation procedure (Step 74) — HS256 with a single shared secret means
+  rotating it invalidates every live token, which needs a planned overlap; authentication
+  event logging (Step 60).
+- **Residual risk: Medium** — token handling is correct; revocation and rate limiting are
+  the open items.
 
 ---
 
