@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 33 — Stock adjustment and availability rules** (Steps 1–32 complete) |
+| **Current step** | **Step 34 — Prevent negative inventory, handle concurrent stock changes** (Steps 1–33 complete) |
 | **Phases complete** | 5 of 12 |
-| **Steps complete** | 32 of 74 |
+| **Steps complete** | 33 of 74 |
 
 ### Goals
 
@@ -217,8 +217,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | # | Step | Status |
 |---|---|---|
 | 32 | Inventory and stock quantities | ✅ |
-| 33 | Stock adjustment and availability rules | 🔵 |
-| 34 | Prevent negative inventory, handle concurrent stock changes | ⬜ |
+| 33 | Stock adjustment and availability rules | ✅ |
+| 34 | Prevent negative inventory, handle concurrent stock changes | 🔵 |
 | 35 | Explain transactions, row locking / conditional updates, race conditions | ⬜ |
 
 ### Phase 7 — Shopping Cart
@@ -2805,6 +2805,116 @@ Settable at creation as opening stock, readable always.
   adjustments (Step 60).
 - **Residual risk: Low** — no concurrency protection yet beyond the constraint, which is
   exactly Step 34's subject.
+
+---
+
+### ✅ Step 33 — Stock Adjustment and Availability Rules
+
+**Completed:** 2026-10-28 · No migration. No new dependency.
+
+An admin endpoint that changes stock by a *difference*, plus the rules and filters that tell
+a customer what can actually be bought.
+
+#### Decision: `POST /products/{id}/stock-adjustments`, not `PATCH /products/{id}`
+
+An absolute value (`stock_quantity = 5`) is calculated from a value read earlier, so sending
+one overwrites whatever happened in between — the classic lost update:
+
+```
+admin reads 5  →  customer buys 1 (stock 4)  →  admin PATCHes 5  →  the sale is gone
+```
+
+A difference (`quantity_change = -1`) carries no assumption about the current value, so two
+adjustments commute: `+10` then `-3` equals `-3` then `+10`. That property is what lets
+Step 34 push the arithmetic into the database as a single statement.
+
+`POST` to a sub-resource reads as *create an adjustment for this product*, which is what is
+happening, and leaves the right name in place for when adjustments must be stored and
+audited.
+
+#### Decision: `ProductUpdate` now sets `extra="forbid"`
+
+Found during verification, not by design review. Pydantic drops unknown keys by default, so
+`PATCH {"stock_quantity": 500}` returned **200 OK** and silently discarded the field — a
+client would reasonably believe stock was now 500. It now returns 422 naming the offending
+key, which points the caller at the adjustment endpoint.
+
+Applied to `ProductUpdate` only, where there is a concrete field whose silent loss is
+dangerous. Not spread across every schema for symmetry.
+
+#### Decision: `is_available` is a `computed_field`, not a column
+
+`is_active and stock_quantity > 0`, derived on every response. Storing it would create a
+third value to keep in step with the two it depends on, and it would be stale the moment
+either changed.
+
+`@computed_field` appears in `model_dump()`; a plain `@property` does not. That distinction is
+load-bearing in both directions — `Settings.database_url` is deliberately a plain property so
+the password can never land in a dump.
+
+#### Known gap, deliberately carried into Step 34
+
+`adjust_stock()` reads the quantity, adds to it in Python, and writes the result back. Two
+requests arriving together can both read 5 and both write 4, losing one sale. This is
+recorded in the function's docstring rather than hidden.
+
+`ck_products_stock_not_negative` still prevents the total going **negative**, so the data
+cannot become nonsense — but it can become **wrong**. Step 34 closes this by moving the
+arithmetic into the database; Step 35 explains the mechanism.
+
+#### Files changed
+
+| File | Change |
+|---|---|
+| `app/core/exceptions.py` | `InsufficientStockError` → 409 |
+| `app/modules/products/schemas.py` | `StockAdjustment`; `is_available`; `extra="forbid"` on `ProductUpdate` |
+| `app/modules/products/repository.py` | `in_stock` condition in `_filters`, threaded through list and count |
+| `app/modules/products/service.py` | `adjust_stock()`; `in_stock` passed through `list_products` |
+| `app/modules/products/router.py` | `POST /{id}/stock-adjustments`; `?in_stock=` query parameter |
+
+#### Verification
+
+Live requests against a running server, admin and customer tokens.
+
+| Case | Expected | Got |
+|---|---|---|
+| admin `+10` | 200, stock 10, available true | ✅ |
+| admin `-3` | 200, stock 7 | ✅ |
+| admin `-99` with 7 in stock | 409, no change | ✅ `Product 16 has 7 in stock, so 99 cannot be removed` |
+| admin `0` | 422 | ✅ `quantity_change must not be zero` |
+| unknown product | 404 | ✅ |
+| customer token | 403 | ✅ `Administrator access required` |
+| no token | 401 | ✅ |
+| `PATCH {"stock_quantity": 500}` | 422, not silent 200 | ✅ `extra_forbidden` |
+| `PATCH {"name": ...}` | 200, still works | ✅ |
+| `?in_stock=true` | only the stocked product | ✅ |
+| `?in_stock=false` | only the zero-stock product | ✅ |
+| no filter | both | ✅ |
+
+The `in_stock` filter was tested against a temporary zero-stock product rather than against a
+single-row table, because a filter cannot be shown to discriminate when there is nothing to
+discriminate between. The temporary product was deleted afterwards.
+
+Ruff clean across 35 files.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** None. Inventory quantities only; no customer, identity,
+  payment or financial-account data is read or written by this endpoint.
+- **Security:** Positive on balance. The endpoint is admin-only (403 for customers, 401
+  unauthenticated, both proven). `extra="forbid"` removes a silent-failure mode in which a
+  client believed a write had succeeded. Error messages disclose the current stock level to an
+  authenticated administrator only, which is information they already have by `GET`.
+- **Data residency / cross-border:** None. Local Docker PostgreSQL on `127.0.0.1:5433`.
+- **Required controls / approvals:** Stock movements are currently **not attributable** — no
+  record of who adjusted what, when, or why. Acceptable for a development build; **not
+  acceptable for production**, where inventory affects revenue recognition and is auditable.
+  Step 60 (audit logging) must cover this endpoint, and the `stock-adjustments` resource name
+  was chosen so that storing the adjustments is an additive change.
+- **Residual risk:** **Medium**, and deliberately so. Two causes: (1) the read-modify-write
+  race described above can under-count stock under concurrency — the integrity floor holds but
+  the figure can be wrong, closed in Step 34; (2) no audit trail of adjustments, closed in
+  Step 60. Both are recorded in code, not only here.
 
 ---
 

@@ -33,3 +33,11 @@ class InUseError(AppError):
     The router maps this to 409 as well: the request is valid, it just
     conflicts with the current state of the data.
     """
+
+
+class InsufficientStockError(AppError):
+    """There is not enough stock to do what was asked.
+
+    The router maps this to 409, like InUseError: the request is valid and
+    the product exists, it just conflicts with how much is on the shelf.
+    """

@@ -49,6 +49,7 @@ def _filters(
     min_price: Decimal | None,
     max_price: Decimal | None,
     category_id: int | None = None,
+    in_stock: bool | None = None,
 ) -> list[ColumnElement[bool]]:
     """Build the WHERE conditions shared by the list and count queries.
 
@@ -69,6 +70,11 @@ def _filters(
         conditions.append(Product.price <= max_price)
     if category_id is not None:
         conditions.append(Product.category_id == category_id)
+    if in_stock is not None:
+        # True means "has at least one", False means "has none". Leaving the
+        # parameter out means "do not care", which is why this tests for
+        # None rather than truthiness.
+        conditions.append(Product.stock_quantity > 0 if in_stock else Product.stock_quantity == 0)
     return conditions
 
 
@@ -82,6 +88,7 @@ def list_products(
     min_price: Decimal | None = None,
     max_price: Decimal | None = None,
     category_id: int | None = None,
+    in_stock: bool | None = None,
     sort: str = "id",
     descending: bool = False,
 ) -> Sequence[Product]:
@@ -89,7 +96,7 @@ def list_products(
     column = SORTABLE_COLUMNS[sort]
     stmt = (
         select(Product)
-        .where(*_filters(search, is_active, min_price, max_price, category_id))
+        .where(*_filters(search, is_active, min_price, max_price, category_id, in_stock))
         .order_by(column.desc() if descending else column.asc())
         # id is unique, so adding it makes the order total. Without a
         # tiebreaker, rows with equal prices can swap between pages and a
@@ -109,12 +116,13 @@ def count_products(
     min_price: Decimal | None = None,
     max_price: Decimal | None = None,
     category_id: int | None = None,
+    in_stock: bool | None = None,
 ) -> int:
     """Count products matching the same filters, ignoring limit and offset."""
     stmt = (
         select(func.count())
         .select_from(Product)
-        .where(*_filters(search, is_active, min_price, max_price, category_id))
+        .where(*_filters(search, is_active, min_price, max_price, category_id, in_stock))
     )
     return db.scalar(stmt) or 0
 

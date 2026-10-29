@@ -13,7 +13,7 @@ from decimal import Decimal
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import AlreadyExistsError, NotFoundError
+from app.core.exceptions import AlreadyExistsError, InsufficientStockError, NotFoundError
 from app.modules.categories import repository as category_repo
 from app.modules.products import repository as repo
 from app.modules.products.models import Product
@@ -38,6 +38,7 @@ def list_products(
     min_price: Decimal | None = None,
     max_price: Decimal | None = None,
     category_id: int | None = None,
+    in_stock: bool | None = None,
     sort: str = "id",
     descending: bool = False,
 ) -> tuple[Sequence[Product], int]:
@@ -52,6 +53,7 @@ def list_products(
         "min_price": min_price,
         "max_price": max_price,
         "category_id": category_id,
+        "in_stock": in_stock,
     }
     items = repo.list_products(
         db, limit=limit, offset=offset, sort=sort, descending=descending, **filters
@@ -99,6 +101,34 @@ def update_product(db: Session, product_id: int, data: ProductUpdate) -> Product
     # Without it every absent field would arrive as None and wipe good data.
     for field, value in changes.items():
         setattr(product, field, value)
+    db.commit()
+    return product
+
+
+def adjust_stock(db: Session, product_id: int, change: int) -> Product:
+    """Add to or take from a product's stock and return its new state.
+
+    change is a difference, not a new total: +10 for a delivery, -1 for a
+    sale. The caller never has to know the current quantity, so it cannot
+    send a stale one.
+
+    Known gap, fixed in Step 34: this reads the quantity, adds to it in
+    Python, and writes the result back. Two requests arriving together can
+    both read 5 and both write 4, so one sale is lost. The check constraint
+    still stops the total going negative, so the data cannot become
+    nonsense - but it can become wrong. Step 34 moves the arithmetic into
+    the database, where the read and the write are a single operation.
+    """
+    product = get_product(db, product_id)
+    new_quantity = product.stock_quantity + change
+    if new_quantity < 0:
+        # Refuse the whole adjustment rather than clamping to zero. Clamping
+        # would report success for a sale that could not be fulfilled.
+        raise InsufficientStockError(
+            f"Product {product_id} has {product.stock_quantity} in stock, "
+            f"so {abs(change)} cannot be removed"
+        )
+    product.stock_quantity = new_quantity
     db.commit()
     return product
 

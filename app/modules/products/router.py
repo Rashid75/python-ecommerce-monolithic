@@ -11,10 +11,15 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.common.schemas import Page
-from app.core.exceptions import AlreadyExistsError, NotFoundError
+from app.core.exceptions import AlreadyExistsError, InsufficientStockError, NotFoundError
 from app.db.session import DbSession
 from app.modules.products import service
-from app.modules.products.schemas import ProductCreate, ProductRead, ProductUpdate
+from app.modules.products.schemas import (
+    ProductCreate,
+    ProductRead,
+    ProductUpdate,
+    StockAdjustment,
+)
 from app.modules.users.dependencies import require_admin
 
 router = APIRouter(prefix="/products", tags=["products"])
@@ -38,6 +43,9 @@ def list_products(
     min_price: Annotated[Decimal | None, Query(ge=0)] = None,
     max_price: Annotated[Decimal | None, Query(ge=0)] = None,
     category_id: Annotated[int | None, Query(ge=1)] = None,
+    in_stock: Annotated[
+        bool | None, Query(description="Only products with stock, or only without")
+    ] = None,
     # Literal restricts the value to these four. FastAPI rejects anything
     # else with a 422 and lists the choices in the docs, so an unknown
     # column name never reaches the query.
@@ -53,6 +61,7 @@ def list_products(
         min_price=min_price,
         max_price=max_price,
         category_id=category_id,
+        in_stock=in_stock,
         sort=sort,
         descending=order == "desc",
     )
@@ -102,6 +111,26 @@ def update_product(product_id: int, data: ProductUpdate, db: DbSession) -> Produ
         return service.update_product(db, product_id, data)
     except NotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+
+# POST to a sub-resource, not PATCH on the product itself. The client is
+# creating an adjustment - "two left the shelf" - rather than declaring what
+# the total now is. A total is calculated from a value read earlier, so
+# sending one overwrites anything that happened in between.
+@router.post(
+    "/{product_id}/stock-adjustments",
+    summary="Adjust stock for a product",
+    dependencies=requires_admin,
+)
+def adjust_stock(product_id: int, data: StockAdjustment, db: DbSession) -> ProductRead:
+    try:
+        return service.adjust_stock(db, product_id, data.quantity_change)
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except InsufficientStockError as exc:
+        # 409, not 400 or 422: the request is well formed and the product
+        # exists. It conflicts with how much is actually on the shelf.
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
 # 204 No Content: it worked and there is nothing to send back.
