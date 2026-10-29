@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 34 — Prevent negative inventory, handle concurrent stock changes** (Steps 1–33 complete) |
+| **Current step** | **Step 35 — Explain transactions, row locking / conditional updates, race conditions** (Steps 1–34 complete) |
 | **Phases complete** | 5 of 12 |
-| **Steps complete** | 33 of 74 |
+| **Steps complete** | 34 of 74 |
 
 ### Goals
 
@@ -218,8 +218,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 |---|---|---|
 | 32 | Inventory and stock quantities | ✅ |
 | 33 | Stock adjustment and availability rules | ✅ |
-| 34 | Prevent negative inventory, handle concurrent stock changes | 🔵 |
-| 35 | Explain transactions, row locking / conditional updates, race conditions | ⬜ |
+| 34 | Prevent negative inventory, handle concurrent stock changes | ✅ |
+| 35 | Explain transactions, row locking / conditional updates, race conditions | 🔵 |
 
 ### Phase 7 — Shopping Cart
 
@@ -2915,6 +2915,136 @@ Ruff clean across 35 files.
   race described above can under-count stock under concurrency — the integrity floor holds but
   the figure can be wrong, closed in Step 34; (2) no audit trail of adjustments, closed in
   Step 60. Both are recorded in code, not only here.
+
+---
+
+### ✅ Step 34 — Prevent Negative Inventory, Handle Concurrent Stock Changes
+
+**Completed:** 2026-10-29 · No migration. No new dependency.
+
+`adjust_stock()` now locks the product row before reading it, closing the lost-update race
+left open in Step 33.
+
+#### The bug, measured before it was fixed
+
+50 concurrent `POST /products/16/stock-adjustments` with `quantity_change: -1`, against the
+Step 33 code, over real HTTP:
+
+```
+started with      100
+sales accepted    50 (of 50 requests)
+stock should be   50
+stock actually is 75
+LOST SALES        25
+```
+
+Half the sales vanished. No error was raised anywhere; every request returned 200.
+
+The second test is the one that matters commercially — 10 items on the shelf, 50 buyers:
+
+| | Step 33 (unfixed) | Step 34 (fixed) |
+|---|---|---|
+| HTTP 200 "sold" | **21** | 10 |
+| HTTP 409 refused | 29 | 40 |
+| stock at end | 0 | 0 |
+
+**The unfixed code sold 21 items from a shelf of 10.** Eleven customers were told their order
+succeeded for goods that do not exist.
+
+`ck_products_stock_not_negative` never fired, because every individual write was non-negative.
+Lost updates meant stock fell more slowly than sales occurred. **A check constraint cannot
+detect this.** It protects the shape of the data, not the correctness of a sequence of
+operations.
+
+#### Why it happens
+
+PostgreSQL's default isolation level is `READ COMMITTED`. It guarantees a transaction never
+reads *uncommitted* data. It does **not** guarantee that a value read is still true when it
+is written. The gap between `SELECT` and `UPDATE` is where the application does its
+arithmetic, and anything may happen in it.
+
+#### Decision: `SELECT ... FOR UPDATE`, not a conditional UPDATE
+
+`repository.get_by_id_for_update()` issues `SELECT ... FOR UPDATE`, verified in the compiled
+SQL. A second transaction reaching the same row waits for the first to commit, then reads the
+value the first wrote. The lock is per **row**, so a sale of one product never blocks a sale
+of another.
+
+The alternative considered was a single conditional statement:
+
+```sql
+UPDATE products SET stock_quantity = stock_quantity + :change
+WHERE id = :id AND stock_quantity + :change >= 0
+```
+
+That is also correct, holds no lock across application code, and is the better choice for a
+pure counter. It was **not** chosen because it returns only a row count: distinguishing *"no
+such product"* (404) from *"not enough stock"* (409) needs a second query, and the error
+message could no longer state how much stock there actually is. The locking read keeps one
+clear code path and keeps the useful message. It also extends directly to checkout, where an
+order must lock several products at once — which a per-statement conditional update cannot
+express.
+
+`db.get()` is deliberately not used for the locking fetch: it can be answered from the session
+cache without reaching the database, and a lock must be taken by the database.
+
+#### Decision: explicit `db.rollback()` before raising `InsufficientStockError`
+
+Otherwise the row lock is held until the request finishes and the session closes, needlessly
+blocking every other sale of that product. Verified: an adjustment immediately after a run of
+409s succeeds rather than hanging.
+
+#### Files changed
+
+| File | Change |
+|---|---|
+| `app/modules/products/repository.py` | `get_by_id_for_update()` |
+| `app/modules/products/service.py` | `adjust_stock()` uses the locking fetch; rollback before 409 |
+
+#### Verification
+
+| Case | Expected | Got |
+|---|---|---|
+| 50 concurrent sales from 100 | end at 50, none lost | ✅ 50, none lost |
+| 50 buyers, 10 in stock | exactly 10 × 200, 40 × 409, end 0 | ✅ |
+| same test, unfixed server | demonstrates the bug | ✅ 21 sold from 10 |
+| compiled SQL contains `FOR UPDATE` | yes | ✅ |
+| admin `+25` / `-5` | 200 | ✅ |
+| admin `-999` | 409 | ✅ |
+| admin `0` | 422 | ✅ |
+| unknown product | 404 | ✅ |
+| customer / no token | 403 / 401 | ✅ |
+| `PATCH` with `stock_quantity` / `name` | 422 / 200 | ✅ |
+| adjustment after a burst of 409s | 200, no hang | ✅ lock released |
+
+Ruff clean. The concurrency tests drive the running server over HTTP and change no application
+code; a `threading.Barrier` synchronises the callers, which widens the window rather than
+creating it.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** None directly. Indirectly material: overselling creates
+  obligations to customers that cannot be met, and inventory figures feed revenue recognition.
+  Correctness here is a financial-reporting concern, not only a technical one.
+- **Security:** Positive. A lost-update race is exploitable — a buyer who fires concurrent
+  requests could previously obtain more units than exist. That is now closed at the data layer
+  rather than relying on client behaviour.
+- **Data residency / cross-border:** None. Local Docker PostgreSQL on `127.0.0.1:5433`.
+- **Required controls / approvals:** Row locks serialise sales **of the same product**. Under
+  sustained contention on one popular item, requests queue, and a slow transaction holds its
+  lock for its full duration. Two controls are now required before production and are **not yet
+  in place**: a statement or lock timeout, so a stuck transaction cannot block a product
+  indefinitely; and monitoring of lock waits. Recorded as open items below. Stock movements
+  remain unattributable until Step 60.
+- **Residual risk:** **Low–Medium.** The correctness defect is closed and demonstrated closed.
+  What remains is availability under contention (no lock timeout) and the absence of an audit
+  trail, both tracked.
+
+#### Open items added
+
+- No `lock_timeout` / `statement_timeout` configured; a stuck transaction can block sales of
+  one product indefinitely. Should be set before Step 71 (deployment).
+- No monitoring of lock waits or long-running transactions.
 
 ---
 

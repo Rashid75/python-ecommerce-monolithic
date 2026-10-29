@@ -32,6 +32,24 @@ def get_by_id(db: Session, product_id: int) -> Product | None:
     return db.get(Product, product_id)
 
 
+def get_by_id_for_update(db: Session, product_id: int) -> Product | None:
+    """Fetch one product and hold its row until the transaction ends.
+
+    with_for_update() adds SELECT ... FOR UPDATE. Another transaction that
+    reaches the same row waits for this one to finish, then reads the value
+    this one wrote - instead of reading the old value and overwriting the
+    change.
+
+    The lock is on the row, not the table, so a sale of one product never
+    blocks a sale of another. It is released by commit or rollback, which
+    is why the caller must do one of them promptly.
+
+    db.get() is not used here: it can answer from the session cache without
+    going to the database, and a lock has to be taken by the database.
+    """
+    return db.scalar(select(Product).where(Product.id == product_id).with_for_update())
+
+
 def get_by_sku(db: Session, sku: str) -> Product | None:
     """Fetch one product by its SKU, or None. Case-insensitive.
 
