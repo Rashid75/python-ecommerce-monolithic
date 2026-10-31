@@ -36,6 +36,18 @@ class CheckoutRequest(BaseModel):
 
     address_id: int = Field(gt=0)
 
+    # The total the customer was actually shown, sent back for
+    # confirmation. This is NOT an exception to the rule above: it is never
+    # used to compute anything, only compared against the total worked out
+    # from locked rows, and a mismatch is refused. The only thing a client
+    # can do by changing it is have its own order rejected.
+    #
+    # It exists because the cart stores no price - Step 39 refused to, so
+    # that a cart always shows today's price - which means the server has
+    # no record of what it last displayed. Something has to carry that, and
+    # the only honest candidate is the client that displayed it.
+    expected_total: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
+
 
 class OrderItemRead(BaseModel):
     """One line of an order, exactly as it was bought.

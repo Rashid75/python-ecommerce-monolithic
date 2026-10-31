@@ -59,3 +59,19 @@ class UnavailableError(AppError):
     which. Distinct from InsufficientStockError, which belongs to stock
     adjustments and means an admin tried to remove more than exists.
     """
+
+
+class EmptyCartError(AppError):
+    """There is nothing to order. The router maps this to 409.
+
+    Not 404: the cart exists, and not 422: the request is well formed. It
+    conflicts with the state of the cart, which is what 409 is for.
+    """
+
+
+class PriceChangedError(AppError):
+    """The total is no longer what the customer was shown. 409.
+
+    Raised instead of charging a different amount. Carries both totals,
+    because the only useful thing to tell someone is what changed.
+    """

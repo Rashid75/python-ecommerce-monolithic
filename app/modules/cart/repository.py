@@ -1,5 +1,7 @@
 """Database queries for carts. No business rules, and never commits."""
 
+from collections.abc import Sequence
+
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -57,6 +59,19 @@ def get_item(db: Session, cart_id: int, product_id: int) -> CartItem | None:
     return db.scalar(
         select(CartItem).where(CartItem.cart_id == cart_id, CartItem.product_id == product_id)
     )
+
+
+def get_items(db: Session, cart_id: int) -> Sequence[CartItem]:
+    """Fetch a cart's lines, deliberately without loading their products.
+
+    Checkout needs the product ids and quantities, nothing more. The
+    products themselves are read afterwards under a row lock, and loading
+    them here first would put unlocked copies in the session that a later
+    read could be answered from - the identity-map trap from Step 37.
+    """
+    return db.scalars(
+        select(CartItem).where(CartItem.cart_id == cart_id).order_by(CartItem.id)
+    ).all()
 
 
 def add(db: Session, obj: Cart | CartItem) -> None:

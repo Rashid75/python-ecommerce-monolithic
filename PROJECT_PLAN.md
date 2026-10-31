@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 47 — Checkout and order creation** (Steps 1–46 complete) |
+| **Current step** | **Step 48 — Validate inventory, atomic stock updates** (Steps 1–47 complete) |
 | **Phases complete** | 8 of 12 |
-| **Steps complete** | 46 of 74 |
+| **Steps complete** | 47 of 74 |
 
 ### Goals
 
@@ -246,8 +246,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 |---|---|---|
 | 45 | Order and order-item models | ✅ |
 | 46 | Immutable order-item snapshots (name, SKU, quantity, unit price) | ✅ |
-| 47 | Checkout and order creation | 🔵 |
-| 48 | Validate inventory, atomic stock updates | ⬜ |
+| 47 | Checkout and order creation | ✅ |
+| 48 | Validate inventory, atomic stock updates | 🔵 |
 | 49 | Order statuses and valid state transitions | ⬜ |
 | 50 | Clear/update cart only after successful order creation | ⬜ |
 | 51 | Order history, order details, authorized cancellation | ⬜ |
@@ -4544,6 +4544,154 @@ verification above exercises the behaviour rather than inspecting the schema.
 - The application's runtime database role should not be able to drop triggers. Least-privilege
   separation from the migration role, before production.
 - The trigger raises on a rewrite attempt and nothing logs it. Ties into Step 60.
+
+### ✅ Step 47 — Checkout and Order Creation
+
+**Completed:** 2026-10-31 · No migration. First order endpoint: `POST /api/v1/orders`.
+
+#### Objective
+
+Turn Step 44's design into code, as one transaction that either produces an order or changes
+nothing at all.
+
+#### The sequence, as written
+
+```python
+cart_id = cart_repo.get_cart_id(db, user_id)      # id only, no lines
+cart_repo.lock_cart(db, cart_id)                  # lock BEFORE reading
+lines = cart_repo.get_items(db, cart_id)          # no products loaded
+# refuse an empty cart -> 409
+shipping = address_service.snapshot_for_shipping(db, user_id, address_id)   # 404 if not theirs
+products = product_repo.lock_many(db, ids)        # sorted, one statement each
+# check and copy from the LOCKED rows -> 409
+# refuse if the total is not what the customer was shown -> 409
+repo.add(db, build_order(...))
+product.stock_quantity -= quantity
+cart_repo.clear_items(db, cart_id)
+db.commit()
+```
+
+#### Decisions
+
+**`lock_many` loops rather than using `WHERE id IN (...)`.** Sorted, because two checkouts
+holding each other's next lock deadlock — the cycle from Step 35. One statement per product,
+because PostgreSQL does not promise the order in which it locks the rows a query returns;
+`ORDER BY` sorts the output, not necessarily the locking. A few extra round trips buys the only
+version that actually guarantees the order.
+
+**`cart_repo.get_items` deliberately does not load products.** Checkout needs ids and quantities
+only. Loading the products here would put unlocked copies in the session that a later read could
+be answered from — the identity-map trap from Step 37.
+
+**The buyability check is duplicated, on purpose.** The cart's version is a courtesy, run
+against an unlocked row so the customer hears about an obvious problem early; it guarantees
+nothing. The one in `orders.service._must_be_buyable` runs against a locked row inside the
+transaction and is the one that decides. Sharing them would hide that difference.
+
+**Everything is wrapped in `try/except Exception: db.rollback(); raise`.** A failure releases the
+cart and product locks immediately rather than holding them until the request ends.
+
+**New exceptions.** `EmptyCartError` → 409: not 404 (the cart exists) and not 422 (the request is
+well formed) — it conflicts with the state of the cart. `PriceChangedError` → 409, below.
+
+**201, unlike every cart endpoint's 200.** This creates a record that did not exist and will
+never be replaced by a later request.
+
+#### The price gate: `expected_total`
+
+Verification of the first version showed a real defect: the customer saw 19.99, the shop
+repriced, and checkout charged 99.99 with no confirmation and no warning. Nothing contradicted
+the Step 44 design — the design never said what happens when the locked price differs from the
+one the customer was shown.
+
+Decided: **refuse with 409 and show the new total.** The customer confirms again or does not.
+
+This needs the client to send back the total it displayed, because **the server has no record of
+what it last showed.** Step 39 deliberately refused to store a price on the cart, so a cart
+always reflects today's price. Something has to carry that number across the request boundary
+and the only honest candidate is the client that displayed it.
+
+`expected_total` is **not** an exception to the Step 43 rule that a field a client can send is a
+field an attacker can set. It is never used to compute anything — only compared against the
+total worked out from locked rows — so the only thing a client achieves by changing it is having
+its own order rejected. It is required, so a client cannot opt back into the silent re-price.
+
+The message gives both totals and not which product moved: the cart stores no per-line price, so
+naming the line would be a guess.
+
+#### Files added or changed
+
+| File | Change |
+|---|---|
+| `app/modules/orders/service.py` | `checkout`, `_must_be_buyable` |
+| `app/modules/orders/router.py` | `POST /orders` |
+| `app/modules/orders/schemas.py` | `expected_total` on `CheckoutRequest` |
+| `app/modules/products/repository.py` | `lock_many` |
+| `app/modules/cart/repository.py` | `get_items` |
+| `app/core/exceptions.py` | `EmptyCartError`, `PriceChangedError` |
+| `app/api/router.py` | registers the orders router |
+
+#### Verification
+
+21 of 21 over real HTTP against a live server.
+
+| Case | Result |
+|---|---|
+| an empty cart | 409 — *Your cart is empty* |
+| someone else's address id | 404 — *Address 43 does not exist* |
+| an address that does not exist | 404, the same message shape |
+| a client-supplied `total` | 422 — rejected by `extra="forbid"` |
+| `expected_total` omitted | 422 — it is required |
+| not enough stock | 409 — *Only 1 of Blue Mug are left, and you asked for 2* |
+| — the other product's stock | untouched, 10 of 10 |
+| — the cart | still has both lines |
+| a withdrawn product | 409 — *Red Mug is no longer on sale* |
+| — stock | still 10 and 10 |
+| **the price moved, old total sent** | **409 — *The total is now 216.48, not 56.48. Check your cart and try again.*** |
+| — stock | untouched, 10 and 10 |
+| — the cart | survived the refusal, 2 lines |
+| — the cart now shows | 216.48 |
+| the customer confirms the new total | **201** |
+| charged | 216.48, what was confirmed |
+| status | `pending` |
+| the shipping address | copied into the order |
+| `user_id` | absent from the response |
+| stock | taken: 8 and 7 |
+| the cart | cleared |
+
+Every refusal left stock and cart exactly as they were — Step 44's atomicity holding in practice
+rather than in a diagram.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** The price gate closes a consumer-protection exposure found
+  during verification rather than review. Charging an amount the customer was not shown and did
+  not confirm is difficult to defend in any of the three jurisdictions, and it would have been
+  live code had the test only asserted the happy path. What remains is that **nothing records
+  the confirmation**: the 409 and the customer's second, confirming request are not logged
+  anywhere, so the shop cannot later evidence that the amount was agreed. That belongs with the
+  audit log in Step 60 and is now a specific requirement rather than a general one.
+- **Security:** The contract holds under test. A client-supplied `total` is rejected, an address
+  belonging to another customer returns 404 rather than 403 so the response cannot be used to
+  discover which ids are real, and no id in the path means no order can be built from anyone
+  else's cart. Price and availability come from locked rows, so neither can be influenced by what
+  the client sends — `expected_total` included, which can only cause a refusal.
+- **Data residency / cross-border:** Unchanged. No payment call exists yet; the order is created
+  as `pending` and nothing leaves the system boundary.
+- **Required controls / approvals:** Still no idempotency key — a double-submitted checkout is
+  serialised by the cart lock and the second attempt gets a 409 for an empty cart, which is the
+  right answer by accident rather than by design (Step 44). Still no `lock_timeout`, which now
+  matters in production code rather than in a demonstration, since checkout holds a cart lock and
+  several product locks at once. Pending orders still hold stock indefinitely.
+- **Residual risk:** **Low** for the checkout path itself, which is demonstrated on every refusal
+  as well as the success. The project's standing **Medium** from Step 45 — personal data that
+  deletion will not reach — is unchanged.
+
+#### Open items added
+
+- The price confirmation is not recorded anywhere. The shop cannot evidence that the customer
+  agreed to the amount charged. Step 60.
+- `lock_timeout` is still unset and checkout now holds several locks at once in production code.
 
 ## 7. Standing Security & Compliance Commitments
 

@@ -5,7 +5,7 @@ takes the session as its first argument, so the caller controls the
 transaction - these functions never commit.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from decimal import Decimal
 
 from sqlalchemy import ColumnElement, func, or_, select
@@ -48,6 +48,32 @@ def get_by_id_for_update(db: Session, product_id: int) -> Product | None:
     going to the database, and a lock has to be taken by the database.
     """
     return db.scalar(select(Product).where(Product.id == product_id).with_for_update())
+
+
+def lock_many(db: Session, product_ids: Iterable[int]) -> dict[int, Product]:
+    """Lock several products at once, returning them keyed by id.
+
+    Sorted, and one statement per product. Both matter.
+
+    Sorted, because two checkouts holding each other's next lock deadlock -
+    the cycle demonstrated in Step 35. If every caller takes its locks in
+    the same order, the second one simply waits.
+
+    One statement per product rather than a single WHERE id IN (...),
+    because PostgreSQL does not promise the order in which it locks the
+    rows a query returns. ORDER BY would sort the output, not necessarily
+    the locking. A loop is a few more round trips and is the only version
+    that actually guarantees the order.
+
+    A missing id is simply absent from the result; the caller decides what
+    that means.
+    """
+    found: dict[int, Product] = {}
+    for product_id in sorted(set(product_ids)):
+        product = db.scalar(select(Product).where(Product.id == product_id).with_for_update())
+        if product is not None:
+            found[product_id] = product
+    return found
 
 
 def get_by_sku(db: Session, sku: str) -> Product | None:
