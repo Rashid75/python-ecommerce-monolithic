@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 36 — Cart and cart-item models** (Steps 1–35 complete, Phase 6 done) |
+| **Current step** | **Step 37 — Cart retrieval and item management endpoints** (Steps 1–36 complete) |
 | **Phases complete** | 6 of 12 |
-| **Steps complete** | 35 of 74 |
+| **Steps complete** | 36 of 74 |
 
 ### Goals
 
@@ -225,8 +225,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 
 | # | Step | Status |
 |---|---|---|
-| 36 | Cart and cart-item models | 🔵 |
-| 37 | Cart retrieval and item management endpoints | ⬜ |
+| 36 | Cart and cart-item models | ✅ |
+| 37 | Cart retrieval and item management endpoints | 🔵 |
 | 38 | Quantity changes and item removal | ⬜ |
 | 39 | Price and availability handling in a cart | ⬜ |
 | 40 | When to calculate prices and validate inventory (never trust client prices) | ⬜ |
@@ -3163,6 +3163,127 @@ deadlock demonstration were deleted.
   one transaction.
 - **Residual risk:** **Low.** This step adds no attack surface and changes no behaviour. The
   risks it describes are inherited from Step 34 and already tracked.
+
+---
+
+### ✅ Step 36 — Cart and Cart-Item Models
+
+**Completed:** 2026-10-31 · Phase 7 begins. Migration generated and run by the user.
+
+`app/modules/cart/` with two tables: `carts` (one per user) and `cart_items` (one row per
+product per cart). Module named `cart`, singular, following the target structure in section 4
+rather than the plural used by `products` and `categories`.
+
+#### Decision: no price column on `cart_items`
+
+The most consequential decision in this step. A cart is working state, not a quote. Copying
+the price in when an item is added would show the customer a stale number for as long as the
+cart sits there, and would create a second place where prices live — one that silently drifts
+from `products`.
+
+The cart reads today's price from `products` on every request. The price is frozen **exactly
+once**, when the order is created (Phase 9). The standing rule, carried into Steps 39–40: the
+client never sends a price, and the cart never remembers one.
+
+#### Decision: one row per product per cart
+
+`uq_cart_items_cart_id_product_id`. Adding the same product again increases the quantity
+rather than creating a second line. Enforced by the database, not by trusting the service to
+remember — the same reasoning as the SKU uniqueness index.
+
+#### Decision: `quantity > 0`, not `>= 0`
+
+A line holding zero of something is not a line. Removing an item is a `DELETE`, not an update
+to zero. `ck_cart_items_quantity_is_positive`.
+
+#### Decision: three foreign keys, three different delete rules
+
+| Link | Rule | Reasoning |
+|---|---|---|
+| `carts.user_id` → `users` | `CASCADE` | a cart has no meaning without its owner and no value as a record, so there is nothing to decide |
+| `cart_items.cart_id` → `carts` | `CASCADE` | a line has no meaning without its cart |
+| `cart_items.product_id` → `products` | `RESTRICT` | deleting a product a customer is about to buy should require a decision; `is_active=false` is how a product is retired |
+
+Orders in Phase 9 are the opposite case and must never cascade: an order is a financial record
+and survives the deletion of everything it refers to.
+
+#### Decision: no reverse relationship on `Product`
+
+`CartItem.product` is one-directional. `Category.products` needed `passive_deletes="all"`
+because the ORM would otherwise load the children and clear their foreign key before issuing
+the `DELETE`, bypassing `ON DELETE RESTRICT` entirely — a bug found by testing the behaviour
+in Step 27. With no collection on `Product` to load, there is nothing to bypass.
+
+This is an assumption about ORM behaviour, so it is listed below as something to verify by
+attempting the delete, not by reading the model.
+
+#### Indexing
+
+`cart_items` has no standalone index on `cart_id` and does not need one: the unique index on
+`(cart_id, product_id)` serves any query filtering on `cart_id`, which is its leftmost column.
+`ix_cart_items_product_id` does exist, because PostgreSQL does not index foreign keys
+automatically and `ON DELETE RESTRICT` checks it on every product delete.
+
+#### Files added
+
+| File | Purpose |
+|---|---|
+| `app/modules/cart/__init__.py` | module marker |
+| `app/modules/cart/models.py` | `Cart`, `CartItem` |
+| `alembic/env.py` | imports `Cart`, `CartItem` so autogenerate sees them |
+
+#### Verification
+
+Compiled DDL inspected before the migration was generated: both tables, the composite unique
+index, the FK delete rules and the check constraint all present and correct. Ruff clean.
+
+Migration `f83d74c67aef` reviewed before it was run and needed no hand edit — autogenerate
+renders a `CheckConstraint` inside `create_table`, unlike the `add_column` cases in Steps 30
+and 32. `alembic check` then reported no difference between the models and the database.
+`alembic check` uses the same comparison as autogenerate, so it shares that blind spot and
+would not have caught either earlier omission; it is a safety net with a known hole.
+
+Behaviour verified against the migrated database, through the ORM rather than hand-written
+SQL where the ORM is what the service will use:
+
+| Case | Result |
+|---|---|
+| second line for the same `(cart_id, product_id)` | refused, `uq_cart_items_cart_id_product_id` |
+| `quantity = 0` | refused, `ck_cart_items_quantity_is_positive` |
+| deleting a product that sits in a cart | refused, `fk_cart_items_product_id_products` |
+| deleting a cart | its lines are removed |
+| deleting a user | their cart is removed |
+
+The third case confirms the assumption recorded above: with no reverse collection on `Product`,
+the ORM issues the `DELETE` directly and `ON DELETE RESTRICT` fires, rather than clearing the
+children's foreign key first as it did for `Category.products` in Step 27. Verified by
+attempting the delete, not by reading the model.
+
+Temporary user, product and cart created for these tests were removed; `carts` and
+`cart_items` are empty.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** Low but non-zero. A cart links a **customer identity** to
+  purchasing intent, which is personal data under PDPL and the UAE/Bahrain equivalents. It is
+  behavioural rather than financial, and carries no payment or identity document data. Carts
+  are working state with no record-keeping value, so they are a candidate for a retention
+  policy — abandoned carts should not accumulate indefinitely. No retention rule exists yet;
+  recorded as an open item.
+- **Security:** Neutral at this step — models only, no endpoints. The access-control rule is
+  established now and must hold in Step 37: a cart is readable and writable **only by its
+  owner**, derived from the authenticated token, never from a cart id or user id in the
+  request. A cart id in a path parameter would be an IDOR waiting to happen.
+- **Data residency / cross-border:** None. Local Docker PostgreSQL on `127.0.0.1:5433`.
+- **Required controls / approvals:** Cart endpoints (Step 37) must scope every query by the
+  authenticated user. Retention policy for abandoned carts required before production. The
+  no-stored-price rule must survive Steps 39–40.
+- **Residual risk:** **Low.** No endpoint is exposed yet and no data is collected. The risk
+  arrives with Step 37, where ownership scoping becomes the control that matters.
+
+#### Open items added
+
+- No retention policy for abandoned carts; personal data would accumulate indefinitely.
 
 ---
 
