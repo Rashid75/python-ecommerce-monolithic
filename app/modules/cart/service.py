@@ -90,3 +90,54 @@ def add_item(db: Session, user_id: int, product_id: int, quantity: int) -> Cart:
     # Re-read so the response carries the products, which the lock query and
     # the insert above did not load.
     return get_cart(db, user_id)
+
+
+def _locked_item(db: Session, user_id: int, product_id: int) -> tuple[int, CartItem]:
+    """Lock the cart, then find the line. Shared by both change operations.
+
+    The order is the point. Reading the line before taking the lock would
+    let the session answer a later read from the copy it already held, and
+    the lock would protect nothing - the defect found in Step 37.
+    """
+    cart_id = _ensure_cart_id(db, user_id)
+    repo.lock_cart(db, cart_id)
+    item = repo.get_item(db, cart_id, product_id)
+    if item is None:
+        # Release the lock before raising, as in adjust_stock. Otherwise it
+        # is held until the request finishes and the session closes.
+        db.rollback()
+        raise NotFoundError(f"Product {product_id} is not in your cart")
+    return cart_id, item
+
+
+def set_item_quantity(db: Session, user_id: int, product_id: int, quantity: int) -> Cart:
+    """Set a line to an exact quantity.
+
+    The product is not re-checked for existence: a line can only exist
+    because the product did, and ON DELETE RESTRICT stops it disappearing
+    underneath. Whether it is still active or in stock is Step 39.
+    """
+    _, item = _locked_item(db, user_id, product_id)
+    item.quantity = quantity
+    db.commit()
+    return get_cart(db, user_id)
+
+
+def remove_item(db: Session, user_id: int, product_id: int) -> Cart:
+    """Remove one line from the cart."""
+    _, item = _locked_item(db, user_id, product_id)
+    repo.remove_item(db, item)
+    db.commit()
+    return get_cart(db, user_id)
+
+
+def clear_cart(db: Session, user_id: int) -> None:
+    """Remove every line, keeping the cart itself.
+
+    The cart row stays. It carries no state of its own beyond its owner, and
+    deleting it would only mean creating it again on the next request.
+    """
+    cart_id = _ensure_cart_id(db, user_id)
+    repo.lock_cart(db, cart_id)
+    repo.clear_items(db, cart_id)
+    db.commit()

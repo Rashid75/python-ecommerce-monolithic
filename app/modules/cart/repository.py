@@ -1,6 +1,6 @@
 """Database queries for carts. No business rules, and never commits."""
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.modules.cart.models import Cart, CartItem
@@ -63,3 +63,19 @@ def add(db: Session, obj: Cart | CartItem) -> None:
     """Stage a new cart or cart line. The caller commits."""
     db.add(obj)
     db.flush()
+
+
+def remove_item(db: Session, item: CartItem) -> None:
+    """Stage one cart line for deletion. The caller commits."""
+    db.delete(item)
+
+
+def clear_items(db: Session, cart_id: int) -> int:
+    """Delete every line of a cart in one statement, returning how many.
+
+    A single DELETE rather than loading the lines and removing them one by
+    one: the rows are not needed for anything, so fetching them would be
+    work done only to throw it away.
+    """
+    result = db.execute(delete(CartItem).where(CartItem.cart_id == cart_id))
+    return result.rowcount

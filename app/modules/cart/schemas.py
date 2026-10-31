@@ -26,6 +26,25 @@ class CartItemAdd(BaseModel):
     quantity: int = Field(default=1, gt=0, le=MAX_QUANTITY)
 
 
+class CartItemSetQuantity(BaseModel):
+    """Set a cart line to an exact quantity.
+
+    Absolute, unlike the stock adjustments in Step 33, and for a reason
+    rather than by accident. Stock is shared: setting it to a number means
+    "I believe it is 4, make it 3", and that belief can already be wrong.
+    A cart belongs to one person, so "I want 3" is a fact about their
+    intent, not an inference about state someone else may have changed.
+
+    Zero is rejected rather than treated as removal. Emptying a line is a
+    different operation and has its own endpoint, and quantity > 0 is what
+    the database enforces anyway.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    quantity: int = Field(ge=1, le=MAX_QUANTITY)
+
+
 class CartItemRead(BaseModel):
     """One line of the cart.
 

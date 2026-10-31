@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 38 — Quantity changes and item removal** (Steps 1–37 complete) |
+| **Current step** | **Step 39 — Price and availability handling in a cart** (Steps 1–38 complete) |
 | **Phases complete** | 6 of 12 |
-| **Steps complete** | 37 of 74 |
+| **Steps complete** | 38 of 74 |
 
 ### Goals
 
@@ -227,8 +227,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 |---|---|---|
 | 36 | Cart and cart-item models | ✅ |
 | 37 | Cart retrieval and item management endpoints | ✅ |
-| 38 | Quantity changes and item removal | 🔵 |
-| 39 | Price and availability handling in a cart | ⬜ |
+| 38 | Quantity changes and item removal | ✅ |
+| 39 | Price and availability handling in a cart | 🔵 |
 | 40 | When to calculate prices and validate inventory (never trust client prices) | ⬜ |
 
 ### Phase 8 — Addresses and Checkout Preparation
@@ -3406,6 +3406,114 @@ removal confirmed by count: `carts` 0, `cart_items` 0, `products` 1, `users` 2.
   carts still required before production. Steps 39–40 must preserve the no-stored-price rule.
 - **Residual risk:** **Low.** Access control is structural and proven, the concurrency defect
   found here is closed and demonstrated closed, and no financial or payment data is handled.
+
+---
+
+### ✅ Step 38 — Quantity Changes and Item Removal
+
+**Completed:** 2026-10-31 · No migration. No new dependency.
+
+`PUT /cart/items/{product_id}`, `DELETE /cart/items/{product_id}` and `DELETE /cart`.
+
+#### Decision: absolute quantities here, after arguing against them in Step 33
+
+Step 33 refused an absolute `stock_quantity` and required a difference. This step does the
+opposite, deliberately.
+
+| | Stock | Cart line |
+|---|---|---|
+| Who changes it | many customers and admins, concurrently | **one person — the owner** |
+| "set to 3" means | "I believe it is 4, make it 3" — an assumption that can already be wrong | "I want 3" — a fact about intent |
+| A lost update | erases someone else's sale | impossible; there is no one else |
+
+The Step 33 rule was never *absolute values are bad*. It was *do not compute a value from
+shared state you no longer hold*. A cart is not shared state, and a customer typing `3` into a
+quantity box is stating intent, not inferring a total.
+
+`PUT` rather than `PATCH`: the line has one mutable field, so sending the quantity replaces
+the whole of it, and the request is idempotent — a retrying client gets the same result.
+
+#### Decision: `quantity = 0` is rejected, not treated as removal
+
+422, with removal given its own endpoint. Conflating two operations in one field means a
+client that sends `0` by accident silently destroys a line. `quantity > 0` is also what the
+database enforces, so the schema and the constraint agree.
+
+#### Decision: different success codes for the two deletes
+
+`DELETE /cart/items/{product_id}` returns **200 with the cart**, because removing a line
+changes the total and the client needs the new one; a bare 204 would force an immediate `GET`.
+`DELETE /cart` returns **204**, because the result of emptying a cart is known in advance and
+there is nothing worth sending.
+
+#### Decision: emptying a cart keeps the cart row
+
+The row carries no state beyond its owner, so deleting it would only mean creating it again on
+the next request. `clear_items` is a single `DELETE` statement rather than loading the lines to
+remove them one by one — the rows are not needed for anything, so fetching them would be work
+done only to throw away.
+
+#### The Step 37 lesson, applied rather than relearned
+
+`_locked_item` exists so that both change operations take the lock **before** the line is read
+for the first time. Reading it beforehand would let the session answer the later read from the
+copy it already held, and the lock would protect nothing — the defect found in Step 37. The
+lock is also released with an explicit `rollback()` before raising `NotFoundError`, as in
+`adjust_stock`.
+
+#### Files changed
+
+| File | Change |
+|---|---|
+| `app/modules/cart/schemas.py` | `CartItemSetQuantity` |
+| `app/modules/cart/repository.py` | `remove_item`, `clear_items` |
+| `app/modules/cart/service.py` | `_locked_item`, `set_item_quantity`, `remove_item`, `clear_cart` |
+| `app/modules/cart/router.py` | `PUT /items/{product_id}`, `DELETE /items/{product_id}`, `DELETE ""` |
+
+#### Verification
+
+24 of 24 assertions over HTTP against a running server:
+
+| Group | Cases |
+|---|---|
+| access control | `PUT`, `DELETE` item and `DELETE` cart with no token → 401 |
+| setting | 2 → 7 gives quantity exactly 7 and total `102.00` = 7×12.00 + 4×4.50, still two lines; the same request again is idempotent; lowering to 1 works |
+| rejections | quantity 0 → 422; 1000 → 422; unknown field → 422; product not in the cart → 404 |
+| removal | removing a line gives 200 with the new total `18.00`; removing it again → 404; emptying gives 204 and an empty cart; emptying an already-empty cart → 204 |
+| ownership | the shopper's `PUT`, `DELETE` item and `DELETE` cart all leave the admin's identical line untouched |
+
+Two concurrency runs:
+
+- **20 interleaved `PUT`/`DELETE` on one line** → `{200: 1, 404: 19}`, no 500s. Recorded
+  honestly: this sequence **degenerates** once the first `DELETE` wins, so it mostly exercises
+  the 404 path and is weak evidence on its own.
+- **20 concurrent `PUT`s with 20 different quantities** → 20 × 200, **one** line, final
+  quantity **14** — a value that was actually sent rather than a corrupted sum. Last writer
+  wins, which is correct for absolute semantics.
+
+Ruff clean. All test data removed; `carts` 0, `cart_items` 0, `products` 1, `users` 2.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** Unchanged from Step 37. Cart contents remain personal data
+  linking a customer identity to purchasing intent. `DELETE /cart` gives a customer a way to
+  erase that intent on demand, which is a small step towards a deletion right, but it is not a
+  retention policy and abandoned carts still accumulate — open item.
+- **Security:** Access control stays structural: no cart id or user id is accepted from any
+  request, so the three new endpoints add no parameter to tamper with. Isolation was proven by
+  driving the shopper's `PUT`, `DELETE` item and `DELETE` cart against an admin holding an
+  identical line for the same product, and checking the admin's cart after each. `DELETE /cart`
+  is the most destructive endpoint in the API so far and is bounded to the caller's own data by
+  construction.
+- **Data residency / cross-border:** None. Local Docker PostgreSQL on `127.0.0.1:5433`. All
+  test data synthetic.
+- **Required controls / approvals:** Still no rate limiting on cart mutations (Step 63), and
+  still no audit of who emptied a cart and when — low consequence while a cart is working
+  state, but it must not carry into orders, where the equivalent action is financially
+  material. Retention policy still required before production.
+- **Residual risk:** **Low.** Ownership is enforced by construction and proven by test, the
+  locking order follows the rule established in Step 37, and concurrent writes were shown to
+  produce a value that was actually sent rather than a corrupted one.
 
 ---
 

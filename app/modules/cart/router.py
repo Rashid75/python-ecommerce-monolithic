@@ -13,7 +13,12 @@ from app.core.exceptions import NotFoundError, ValidationError
 from app.db.session import DbSession
 from app.modules.cart import service
 from app.modules.cart.models import Cart
-from app.modules.cart.schemas import CartItemAdd, CartItemRead, CartRead
+from app.modules.cart.schemas import (
+    CartItemAdd,
+    CartItemRead,
+    CartItemSetQuantity,
+    CartRead,
+)
 from app.modules.users.dependencies import CurrentUser
 
 router = APIRouter(prefix="/cart", tags=["cart"])
@@ -62,3 +67,35 @@ def add_item(data: CartItemAdd, user: CurrentUser, db: DbSession) -> CartRead:
     except ValidationError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     return _to_read(cart)
+
+
+# PUT, not PATCH: the line has one mutable field, so sending the quantity
+# replaces the whole of it. It is also idempotent - sending the same request
+# twice leaves the same result, which a retrying client can rely on.
+@router.put("/items/{product_id}", summary="Set the quantity of an item in my cart")
+def set_item_quantity(
+    product_id: int, data: CartItemSetQuantity, user: CurrentUser, db: DbSession
+) -> CartRead:
+    try:
+        cart = service.set_item_quantity(db, user.id, product_id, data.quantity)
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    return _to_read(cart)
+
+
+# Returns the cart rather than 204. Removing a line changes the total, and
+# the client needs the new one; a bare 204 would force an immediate GET.
+@router.delete("/items/{product_id}", summary="Remove an item from my cart")
+def remove_item(product_id: int, user: CurrentUser, db: DbSession) -> CartRead:
+    try:
+        cart = service.remove_item(db, user.id, product_id)
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    return _to_read(cart)
+
+
+# 204 here, unlike the line delete above: the result of emptying a cart is
+# known in advance, so there is nothing worth sending back.
+@router.delete("", status_code=status.HTTP_204_NO_CONTENT, summary="Empty my cart")
+def clear_cart(user: CurrentUser, db: DbSession) -> None:
+    service.clear_cart(db, user.id)
