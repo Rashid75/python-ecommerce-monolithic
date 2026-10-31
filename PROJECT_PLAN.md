@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 42 — Associate addresses with users** (Steps 1–41 complete) |
+| **Current step** | **Step 43 — Shipping and checkout data contracts** (Steps 1–42 complete) |
 | **Phases complete** | 7 of 12 |
-| **Steps complete** | 41 of 74 |
+| **Steps complete** | 42 of 74 |
 
 ### Goals
 
@@ -236,8 +236,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | # | Step | Status |
 |---|---|---|
 | 41 | Customer addresses | ✅ |
-| 42 | Associate addresses with users | 🔵 |
-| 43 | Shipping and checkout data contracts | ⬜ |
+| 42 | Associate addresses with users | ✅ |
+| 43 | Shipping and checkout data contracts | 🔵 |
 | 44 | Order creation design with transaction boundaries | ⬜ |
 
 ### Phase 9 — Orders and Checkout
@@ -3896,6 +3896,131 @@ Synthetic test data only, removed afterwards; no addresses left behind.
 - No log-masking rule for address fields.
 - Admin read access to customer addresses must be designed deliberately in Phase 9, not
   inherited from the generic admin role.
+
+---
+
+### ✅ Step 42 — Associate Addresses with Users
+
+**Completed:** 2026-10-31 · No migration. No new dependency.
+
+Five endpoints under `/addresses`, all scoped to the authenticated customer.
+
+#### Correction to the Step 41 rule: scoping, not absence
+
+Step 37 removed the cart id from every URL, and Step 41 restated that as the rule for
+addresses. It does not transfer. A customer has **one** cart, so the id was unnecessary; a
+customer has **many** addresses, so they must be able to name one to edit or delete it.
+
+The defence is therefore scoping rather than absence:
+
+```python
+select(Address).where(Address.id == address_id, Address.user_id == user_id)
+```
+
+`user_id` is part of the `WHERE` clause rather than checked after the row is fetched. A
+forgotten check is a data leak; a missing `WHERE` clause is a query that returns nothing.
+
+#### Decision: 404 for someone else's address, never 403
+
+A 403 would confirm that the address exists, turning the endpoint into an oracle for
+discovering which ids are real. 404 says only *not yours or not there* and does not
+distinguish between them. This is the opposite of the Step 30 choice, where 403 was right
+because the resource was public and only the action was restricted — here the existence of the
+row is itself the secret.
+
+#### Decision: the first address becomes the default whatever the request said
+
+A customer with addresses but no default is a state checkout would have to cope with for no
+reason.
+
+#### Decision: unsetting the only default is refused, not obeyed
+
+`PATCH {"is_default": false}` on the current default returns 422 telling the customer to make
+another address the default instead. Obeying it would leave them with addresses and none
+chosen — the state the previous decision exists to prevent.
+
+#### Decision: deleting the default promotes the oldest survivor
+
+So *if you have addresses, one of them is the default* stays true without the customer having
+to think about it.
+
+#### Decision: address writes serialise on the customer's `users` row
+
+`_lock_address_book` takes `SELECT users.id ... FOR UPDATE`. The thing being protected is
+*this customer's address book*, and the `users` row is the only row that always exists to
+stand for it — there is no address-book row to lock, and the addresses themselves may not
+exist yet.
+
+Without it, two requests could both decide to become the default, both clear the old one, and
+the partial unique index would turn the loser into a 500 rather than a sensible result. Only
+address writes take this lock, so nothing else is serialised by it.
+
+#### Decision: no `Page` envelope on the list
+
+`MAX_ADDRESSES_PER_USER` caps the list at 20, so paging it would be ceremony. The cap is
+enforced in `create_address` with a 422.
+
+#### Files added or changed
+
+| File | Change |
+|---|---|
+| `app/modules/addresses/schemas.py` | `AddressCreate`, `AddressUpdate`, `AddressRead` |
+| `app/modules/addresses/repository.py` | `list_for_user`, `get_for_user`, `count_for_user`, `clear_default`, `add`, `remove` |
+| `app/modules/addresses/service.py` | `_lock_address_book`, list, get, create, update, delete |
+| `app/modules/addresses/router.py` | `GET`, `POST`, `GET /{id}`, `PATCH /{id}`, `DELETE /{id}` |
+| `app/api/router.py` | registers the addresses router |
+
+#### Verification
+
+34 of 34 assertions over HTTP against a running server:
+
+| Group | Cases |
+|---|---|
+| access control | `GET` and `POST` with no token → 401 |
+| creating | `country: "bh"` stored as `BH`; the first address is default unasked; the second is not; a third asking to be default leaves exactly one default and is listed first |
+| validation | three-letter country, digits as country, empty recipient, unknown field, and a `user_id` in the body → 422 each |
+| updating | partial update changes only what was sent; making another address the default leaves exactly one; unsetting the only default → 422 |
+| **ownership** | `GET`, `PATCH` and `DELETE` of another customer's address → **404 each**; their row is verifiably untouched afterwards; their id never appears in my list |
+| deleting | deleting the default promotes another, leaving exactly one; deleting twice → 404 |
+| the cap | 21 creates → `{201: 20, 422: 1}` |
+| concurrency | 5 simultaneous "make me the default" → 5 × 200, no 500s, exactly one default survived |
+
+The ownership group is the one that matters. It attacks the boundary with a real id belonging
+to a real other customer, and checks the victim's row afterwards rather than trusting the
+status code.
+
+Ruff clean. All test data removed; `addresses` 0, `users` 2.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** These are the first endpoints that read and write directly
+  identifying location data. Data minimisation holds — `AddressRead` omits `user_id`, which the
+  client already knows and which would only widen what an error or a log could leak. The
+  20-address cap limits accumulation per customer. `DELETE /addresses/{id}` gives a customer a
+  self-service erasure path for this data, which is a meaningful step towards a deletion right,
+  though **not a retention policy**: nothing expires an address when a customer stops ordering.
+- **Security:** The boundary is enforced in the `WHERE` clause of every query rather than by a
+  check that could be forgotten, and `user_id` cannot be injected through any request body —
+  `extra="forbid"` rejects it with 422, proven by sending it. 404 rather than 403 prevents the
+  endpoint from confirming which address ids exist. Concurrency on the default flag was proven
+  not to produce 500s or two defaults.
+- **Data residency / cross-border:** None today — local Docker PostgreSQL on `127.0.0.1:5433`.
+  Unchanged from Step 41: this is the data whose location must be assessed before any non-local
+  deployment, and any log export or third-party fulfilment integration carrying it is a
+  cross-border transfer.
+- **Required controls / approvals:** Carried forward unchanged and still **not in place** —
+  retention and deletion policy, encryption at rest, log masking for address fields, residency
+  assessment. Added by this step: address endpoints are **not rate limited**, so the cap is on
+  stored rows rather than on request volume, and enumeration attempts against
+  `GET /addresses/{id}` are neither throttled nor logged. Folds into Steps 60 and 63.
+- **Residual risk:** **Medium**, unchanged from Step 41 and for the same reasons — the access
+  control added here is sound and proven, but the surrounding controls on retention,
+  encryption, masking and monitoring do not exist yet. The endpoints themselves are **Low**.
+
+#### Open items added
+
+- Address endpoints are not rate limited; enumeration attempts against `GET /addresses/{id}`
+  are neither throttled nor logged.
 
 ---
 
