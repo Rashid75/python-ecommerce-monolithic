@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 46 — Immutable order-item snapshots** (Steps 1–45 complete) |
+| **Current step** | **Step 47 — Checkout and order creation** (Steps 1–46 complete) |
 | **Phases complete** | 8 of 12 |
-| **Steps complete** | 45 of 74 |
+| **Steps complete** | 46 of 74 |
 
 ### Goals
 
@@ -245,8 +245,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | # | Step | Status |
 |---|---|---|
 | 45 | Order and order-item models | ✅ |
-| 46 | Immutable order-item snapshots (name, SKU, quantity, unit price) | 🔵 |
-| 47 | Checkout and order creation | ⬜ |
+| 46 | Immutable order-item snapshots (name, SKU, quantity, unit price) | ✅ |
+| 47 | Checkout and order creation | 🔵 |
 | 48 | Validate inventory, atomic stock updates | ⬜ |
 | 49 | Order statuses and valid state transitions | ⬜ |
 | 50 | Clear/update cart only after successful order creation | ⬜ |
@@ -4425,6 +4425,125 @@ Note for reading `\d orders`: PostgreSQL rewrites `status IN (...)` into
 - A customer with orders cannot be deleted. Erasure now requires a documented procedure that
   separates order data from address-book data; deleting rows is no longer an option.
 - Single-currency assumption, undeclared anywhere in the schema. Decide before launch.
+
+### ✅ Step 46 — Immutable Order-Item Snapshots
+
+**Completed:** 2026-10-31 · One migration, applied. Still no endpoints — checkout is Step 47.
+
+#### Objective
+
+Step 45 created columns called `sku`, `name` and `unit_price` on `order_items`. Nothing yet
+filled them, and nothing stopped anyone changing them afterwards. This step does both, so that
+*immutable* describes the database rather than an intention.
+
+#### Decisions
+
+**The copy happens in the service, not the repository.** Deciding *which* price is frozen is a
+business rule; writing rows is not. `build_order` takes products the caller has already locked
+and returns an unsaved `Order`, so Step 47 keeps control of the transaction. A function that
+fetched its own products would be reading them unlocked — the staleness Step 44 ruled out.
+
+**The total is summed from the copies.**
+
+```python
+total = sum((item.unit_price * item.quantity for item in items), Decimal("0.00"))
+```
+
+Not from `product.price` a second time. Reading the live price again would let the total
+disagree with the lines it is supposed to be the sum of. The `Decimal("0.00")` start value
+matters as well: bare `sum()` begins at integer `0` and mixes an `int` into money arithmetic.
+
+**The repository has no update function for order lines**, because there should be no way to
+change one at all. A mistake on an order is corrected by a new record, not by rewriting the old
+one.
+
+**A database trigger, chosen over application-level discipline alone.** The repository binds
+only this application; a stray `UPDATE` in `psql`, or a future developer adding a setter, would
+silently rewrite a financial record.
+
+```sql
+CREATE TRIGGER order_items_no_update
+    BEFORE UPDATE ON order_items
+    FOR EACH ROW EXECUTE FUNCTION order_items_are_immutable();
+```
+
+`BEFORE UPDATE`, so nothing is written when it raises. `ERRCODE = 'restrict_violation'` gives it
+SQLSTATE `23001` instead of the generic `P0001`, so code can recognise it rather than matching
+on message text.
+
+**`UPDATE` only, not `DELETE`.** Covering `DELETE` would break the `ON DELETE CASCADE` from
+`orders` and make an order impossible to remove at all. Deleting a whole order is a different
+decision from rewriting one: it leaves nothing behind that could mislead, while a rewritten line
+leaves an invoice that lies.
+
+#### Files added or changed
+
+| File | Change |
+|---|---|
+| `app/modules/orders/service.py` | `build_order` |
+| `app/modules/orders/repository.py` | `add` |
+| `alembic/versions/..._make_order_items_immutable.py` | the trigger and its function |
+
+#### Verification
+
+12 of 12 against the live database. An order was placed for two products, then the shop renamed,
+re-SKU'd, repriced and deactivated both:
+
+| Case | Result |
+|---|---|
+| total summed from the copies | 2 × 19.99 + 3 × 5.50 = **56.48** |
+| after the products changed — line name | still `Blue Mug` |
+| — unit price | still `19.99` |
+| — SKU | still `S46-A` |
+| — the discontinued product's line | still `Red Mug` |
+| — the total | still `56.48` |
+| the live product meanwhile | `Mug, Azure (2027 range)` at `29.99` |
+| `UPDATE order_items SET unit_price = 0.01` | refused — *order_items row 4 cannot be changed once written* |
+| its SQLSTATE | `23001` |
+| the same change through the ORM | refused by the same trigger |
+| `DELETE FROM orders` | cascaded; 0 lines left |
+
+That last row is the one that would have failed had the trigger covered `DELETE` too.
+
+`alembic check`: *No new upgrade operations detected.* Ruff clean; no test data left behind.
+
+#### A limitation worth knowing
+
+**Alembic cannot see the trigger.** Autogenerate and `alembic check` compare tables, columns,
+indexes and constraints — not functions or triggers. If someone drops this trigger, nothing in
+the project detects it, and `alembic check` will keep reporting that everything is in order. The
+same blind-spot family as the `CheckConstraint` Step 32 silently omitted, and the reason the
+verification above exercises the behaviour rather than inspecting the schema.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** This is the step that makes order records defensible. A
+  financial record that can be edited in place is not evidence of anything, and the demonstration
+  above — price changed on the product, unchanged on the order, direct `UPDATE` refused — is the
+  kind of evidence an audit asks for. It does **not** amount to an audit trail: nothing records
+  *who* created an order or *what was attempted*. That remains Step 60 and is now more clearly
+  needed, since the trigger produces a refusal that nobody is logging.
+- **Security:** Narrows the blast radius of a compromised application credential. Application
+  code can no longer alter a price after the fact, so an attacker with the app's database user
+  cannot quietly rewrite what was charged — they would have to drop the trigger, which is a
+  louder, separately-privileged act. A production role for the application should therefore
+  **not** hold the rights to drop triggers or functions; that is a least-privilege control to
+  apply before launch, not a default.
+- **Data residency / cross-border:** Unchanged by this step.
+- **Required controls / approvals:** Database migration privileges should be separated from
+  application runtime privileges, so the role that can drop this trigger is not the role the API
+  runs as. Trigger existence should be monitored, since Alembic will not notice its absence. Both
+  carried forward.
+- **Residual risk:** **Low** for this step, which only removes a capability. The project's
+  standing Medium from Step 45 — personal data that deletion will not reach — is untouched.
+
+#### Open items added
+
+- Alembic does not track triggers or functions; a dropped `order_items_no_update` would go
+  undetected. Needs either a monitoring check or a startup assertion.
+- The application's runtime database role should not be able to drop triggers. Least-privilege
+  separation from the migration role, before production.
+- The trigger raises on a rewrite attempt and nothing logs it. Ties into Step 60.
 
 ## 7. Standing Security & Compliance Commitments
 
