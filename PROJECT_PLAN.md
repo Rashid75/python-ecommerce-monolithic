@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 44 — Order creation design with transaction boundaries** (Steps 1–43 complete) |
-| **Phases complete** | 7 of 12 |
-| **Steps complete** | 43 of 74 |
+| **Current step** | **Step 45 — Order and order-item models** (Steps 1–44 complete, Phase 8 done) |
+| **Phases complete** | 8 of 12 |
+| **Steps complete** | 44 of 74 |
 
 ### Goals
 
@@ -238,13 +238,13 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 41 | Customer addresses | ✅ |
 | 42 | Associate addresses with users | ✅ |
 | 43 | Shipping and checkout data contracts | ✅ |
-| 44 | Order creation design with transaction boundaries | 🔵 |
+| 44 | Order creation design with transaction boundaries | ✅ |
 
 ### Phase 9 — Orders and Checkout
 
 | # | Step | Status |
 |---|---|---|
-| 45 | Order and order-item models | ⬜ |
+| 45 | Order and order-item models | 🔵 |
 | 46 | Immutable order-item snapshots (name, SKU, quantity, unit price) | ⬜ |
 | 47 | Checkout and order creation | ⬜ |
 | 48 | Validate inventory, atomic stock updates | ⬜ |
@@ -4153,6 +4153,152 @@ were run rather than asserted. Ruff clean; no test data left behind.
   erasure procedure covering snapshots is required.
 - No idempotency key on the checkout contract; a double-submitted checkout would create two
   orders. Steps 47 and 52, and adding it will change this contract.
+
+---
+
+### ✅ Step 44 — Order Creation Design with Transaction Boundaries
+
+**Completed:** 2026-10-31 · Phase 8 fully closed. No code change; the design is settled and the
+failure modes it prevents were demonstrated against the live database.
+
+#### The sequence
+
+```
+BEGIN
+ 1.  lock the customer's cart row                     FOR UPDATE
+ 2.  load its lines and their products
+ 3.  refuse an empty cart                             -> 409
+ 4.  snapshot the shipping address (ownership-scoped) -> 404 if not theirs
+ 5.  collect the product ids and SORT them
+ 6.  lock those product rows, in that sorted order    FOR UPDATE
+ 7.  re-read price and stock FROM THE LOCKED ROWS
+ 8.  validate: active, and stock >= quantity          -> 409
+ 9.  INSERT orders       (status 'pending', shipping snapshot, total)
+10.  INSERT order_items  (sku, name, unit_price, quantity - all copies)
+11.  UPDATE products     SET stock_quantity = stock_quantity - n
+12.  DELETE cart_items
+COMMIT
+```
+
+**Line 7 is not redundant.** Everything Phase 7 reported was read without a lock and is now
+potentially stale. The values that decide money and stock must be the ones read after line 6.
+
+**Line 12 is inside the transaction**, not after it. The roadmap phrases Step 50 as *clear the
+cart only after successful order creation*; inside the same transaction is strictly stronger.
+A separate clearing transaction leaves a window in which the order exists and the cart still
+does, and a refresh in that window orders twice.
+
+#### Demonstrated: why it is one transaction
+
+```
+1. One transaction    stock before 100 -> taken to 90 -> failure -> stock after 100
+2. Two transactions   stock before 100 -> committed 90 -> failure -> stock after 90
+```
+
+The second case is the one that reaches a support queue: ten units sold to nobody and no order
+to refund against. Nothing in the database records that it happened; the only trace is a stock
+count that no longer matches the shelf.
+
+#### Demonstrated: why payment is outside it
+
+```
+0.00s  A   locked the product, now calling the payment provider...
+0.30s  B   tries to check out the same product
+3.00s  A   payment returned, committing
+3.01s  B   got the lock after waiting 2.71s
+```
+
+A three-second payment round trip is unremarkable. Holding a row lock across it makes every
+customer buying that product queue behind it, and each waiting request holds a connection from
+a finite pool. At a few hundred checkouts a minute the pool empties and endpoints unrelated to
+orders begin failing.
+
+The boundary is therefore:
+
+```
+transaction 1   create the order as 'pending', take stock, clear the cart   COMMIT
+                --- outside any transaction ---
+                call the payment provider
+transaction 2   record the result, move the status                          COMMIT
+```
+
+**Consequence, recorded now rather than discovered in Phase 10:** taking stock at order
+creation means a pending order that is never paid holds that stock indefinitely. Something
+must release it — an expiry sweep, a timeout, or a compensating return of stock when payment
+fails. This is design debt Phase 10 inherits deliberately, not an oversight.
+
+The alternative — taking stock only after payment succeeds — trades it for a worse problem:
+the shop can accept money for goods it no longer has.
+
+#### Lock ordering across the whole application
+
+| Operation | Locks |
+|---|---|
+| add, change or remove a cart line | cart |
+| adjust stock | product |
+| change addresses | user |
+| **checkout** | **cart, then products sorted by id** |
+
+No operation takes a product lock and then a cart lock, so there is no cycle between resource
+types. Within checkout, sorting the product ids prevents the cycle between two checkouts —
+the deadlock demonstrated in Step 35.
+
+#### What each failure does
+
+| Failure | When | Result |
+|---|---|---|
+| empty cart | before any lock | 409, nothing written |
+| address not the caller's | before product locks | 404, nothing written |
+| product inactive | under lock | 409, rollback, stock untouched |
+| insufficient stock | under lock | 409, rollback |
+| deadlock | under lock | one transaction killed; prevented by sorting |
+| crash before `COMMIT` | any point | nothing happened at all |
+| crash after `COMMIT` | — | order, stock and cart all consistent |
+
+#### Still unresolved, deliberately
+
+A double-submitted checkout creates two orders. Nothing above prevents it: both requests find
+a full cart, both pass validation, and the first one's `DELETE cart_items` only takes effect at
+its commit. Serialising on the cart lock means the second waits rather than racing, and will
+then find an empty cart and get a 409 — which is the right answer by accident rather than by
+design. It is the right answer only while the cart is cleared in the same transaction, and it
+says nothing useful to the customer. A proper idempotency key is Steps 47 and 52.
+
+#### Verification
+
+Three demonstrations against the live database, using `products.stock_quantity` because the
+order tables do not exist yet. No application code was changed. The temporary product was
+removed.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** None directly. Indirectly material: the atomicity
+  established here is what makes stock figures and order records reconcile, and both feed
+  financial reporting. The two-transaction failure shown above produces an inventory
+  discrepancy with no corresponding record, which is precisely the kind of unexplained
+  difference an audit is designed to find.
+- **Security:** Neutral — no new surface. The design fixes two controls that Phase 9 must
+  honour: availability is re-validated under lock rather than trusted from the cart, and the
+  shipping address is resolved through the ownership-scoped lookup rather than read directly.
+- **Data residency / cross-border:** None for the design. The payment call placed outside the
+  transaction **is** a cross-border consideration in its own right: it leaves the system
+  boundary, and what is sent with it must be assessed in Phase 10. Deciding that now, before
+  any integration exists, is cheaper than deciding it afterwards.
+- **Required controls / approvals:** Pending-order stock release must be designed in Phase 10,
+  not left implicit. Idempotency on checkout is required before any real payment integration —
+  a double charge is a regulatory and reputational event, not a bug report. `lock_timeout`
+  remains unset and matters more here than anywhere else, because checkout holds several locks
+  at once.
+- **Residual risk:** **Low** for the design itself, which narrows failure modes rather than
+  adding any. The risks it names — pending-order stock, idempotency, lock timeouts — are all
+  carried forward explicitly and none are closed.
+
+#### Open items added
+
+- A pending order that is never paid holds stock indefinitely; a release mechanism is required
+  in Phase 10.
+- What is sent to the payment provider leaves the system boundary and needs a cross-border
+  assessment before any integration.
 
 ---
 
