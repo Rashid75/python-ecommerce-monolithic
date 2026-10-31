@@ -41,3 +41,11 @@ class InsufficientStockError(AppError):
     The router maps this to 409, like InUseError: the request is valid and
     the product exists, it just conflicts with how much is on the shelf.
     """
+
+
+class ValidationError(AppError):
+    """The request is well formed but breaks a business rule.
+
+    The router maps this to 422. Distinct from Pydantic's own 422, which
+    rejects a request before any rule is consulted.
+    """

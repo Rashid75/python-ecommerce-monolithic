@@ -38,8 +38,11 @@ class Cart(Base):
     # cascade="all, delete-orphan" is the ORM half: removing a CartItem from
     # this list deletes its row, rather than leaving an orphan with a NULL
     # cart_id. The database half is ondelete="CASCADE" on cart_items.
+    # order_by gives the lines a stable order. Without it PostgreSQL may
+    # return them in any order it likes, so a cart could reshuffle itself
+    # between two identical requests.
     items: Mapped[list["CartItem"]] = relationship(
-        back_populates="cart", cascade="all, delete-orphan"
+        back_populates="cart", cascade="all, delete-orphan", order_by="CartItem.id"
     )
 
     __table_args__ = (Index("uq_carts_user_id", user_id, unique=True),)

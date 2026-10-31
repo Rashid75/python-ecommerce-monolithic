@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 37 — Cart retrieval and item management endpoints** (Steps 1–36 complete) |
+| **Current step** | **Step 38 — Quantity changes and item removal** (Steps 1–37 complete) |
 | **Phases complete** | 6 of 12 |
-| **Steps complete** | 36 of 74 |
+| **Steps complete** | 37 of 74 |
 
 ### Goals
 
@@ -226,8 +226,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | # | Step | Status |
 |---|---|---|
 | 36 | Cart and cart-item models | ✅ |
-| 37 | Cart retrieval and item management endpoints | 🔵 |
-| 38 | Quantity changes and item removal | ⬜ |
+| 37 | Cart retrieval and item management endpoints | ✅ |
+| 38 | Quantity changes and item removal | 🔵 |
 | 39 | Price and availability handling in a cart | ⬜ |
 | 40 | When to calculate prices and validate inventory (never trust client prices) | ⬜ |
 
@@ -3284,6 +3284,128 @@ Temporary user, product and cart created for these tests were removed; `carts` a
 #### Open items added
 
 - No retention policy for abandoned carts; personal data would accumulate indefinitely.
+
+---
+
+### ✅ Step 37 — Cart Retrieval and Item Management Endpoints
+
+**Completed:** 2026-10-31 · No migration. No new dependency.
+
+`GET /cart` and `POST /cart/items`, plus the schemas, repository and service behind them.
+Quantity changes and removal are Step 38.
+
+#### Decision: no cart id in any URL
+
+```
+GET  /cart          not  GET  /carts/{cart_id}
+POST /cart/items    not  POST /carts/{cart_id}/items
+```
+
+The cart is always the caller's own, taken from the authenticated token. The moment a cart id
+is a path parameter, a client can type a different number — **IDOR**, one of the most common
+real-world API breaches. The bug cannot exist if the identifier is not in the request.
+
+The same reasoning applies inside: lines are addressed by `product_id`, never by
+`cart_items.id`. The row id is an internal detail, and a client that never sees it can never
+ask for someone else's.
+
+#### Decision: the cart is created lazily, and an empty cart is not a 404
+
+Every signed-in customer conceptually has a cart. It is created on first use rather than at
+registration, so customers who never shop leave no row behind. `GET /cart` for a new customer
+returns an empty cart with `total` of `0`, which is the true answer.
+
+Two simultaneous first requests both find no cart and both try to create one.
+`uq_carts_user_id` lets exactly one win; the loser catches `IntegrityError`, rolls back and
+reads the winner's cart. Same pattern as `create_product` — let the constraint decide rather
+than checking first, because a check-then-insert can be raced.
+
+#### Decision: totals in, availability out
+
+`unit_price`, `line_total` and `total` are included — a cart endpoint without a total is not a
+cart, and the arithmetic is three lines. `Decimal` throughout, summed from `Decimal("0")` so
+an empty cart totals a `Decimal` rather than an `int`.
+
+Deliberately **not** included: whether the product is still active, whether its price has
+moved since the item was added, whether there is enough stock. Those are decisions about what
+to tell the customer, and they are Steps 39 and 40.
+
+#### Two bugs found during verification, both the identity map
+
+Neither was found by review. Both were found by a test asserting on behaviour.
+
+**1. The first add to a new cart returned an empty cart.** The predecessor of `_ensure_cart_id`
+created the `Cart` object, so `cart.items` was already a loaded (empty) collection in the
+session. Re-querying at the end of `add_item` returned that same object, and SQLAlchemy does
+**not** overwrite attributes it already holds — the `selectinload` ran and its result was
+discarded. Fixed with `execution_options(populate_existing=True)` on `get_by_user_id`, whose
+job is to produce the current truth for a response and which must therefore win over the cache.
+
+**2. The row lock protected nothing.** 20 simultaneous adds of the same product all returned
+200 and the quantity reached **4**, losing 16. The cart and its lines were loaded *before*
+`lock_cart` ran, so the later `get_item` was answered from that pre-lock copy. **Locking a row
+and then trusting a copy read beforehand protects nothing.**
+
+Fixed by restructuring rather than by another flag: `repository.get_cart_id` loads only the id,
+the lock is taken, and the line is read for the first time afterwards. The rule is now written
+into both functions — *do not read what you are about to lock, before you lock it*.
+
+This is the same hazard noted in the `get_by_id_for_update` docstring in Step 34, which is why
+`db.get()` was avoided there. It was avoided in one place and walked into in two others.
+
+#### Files added or changed
+
+| File | Change |
+|---|---|
+| `app/modules/cart/schemas.py` | `CartItemAdd`, `CartItemRead`, `CartRead`, `MAX_QUANTITY` |
+| `app/modules/cart/repository.py` | `get_by_user_id`, `get_cart_id`, `lock_cart`, `get_item`, `add` |
+| `app/modules/cart/service.py` | `_ensure_cart_id`, `get_cart`, `add_item` |
+| `app/modules/cart/router.py` | `GET /cart`, `POST /cart/items`, `_to_read` |
+| `app/modules/cart/models.py` | `order_by` on `Cart.items` so lines have a stable order |
+| `app/core/exceptions.py` | `ValidationError` → 422 for a broken business rule |
+| `app/api/router.py` | registers the cart router |
+
+#### Verification
+
+20 of 20 functional assertions, over HTTP, against a running server:
+
+| Group | Cases |
+|---|---|
+| access control | `GET` and `POST` with no token → 401 |
+| retrieval | new customer gets an empty cart, total `0` |
+| adding | 2 then 3 of the same product → **one** line, quantity 5; a second product → 2 lines; total `78.00` = 5×12.00 + 4×4.50; `total_items` 9 |
+| rejections | unknown product 404; quantity 0 and 1000 → 422; unknown field → 422; exceeding the 999 cap → 422 |
+| ownership | admin's cart is separate and empty; adding to it leaves the shopper's cart and total untouched |
+
+Plus two measured properties:
+
+- **Query count:** reading a cart of 5 lines costs **3 queries**, not 11. `selectinload` issues
+  one extra `SELECT` per relationship regardless of row count.
+- **Concurrency:** 20 simultaneous adds of the same product → 20 × 200, **one** line,
+  quantity **20**. Nothing lost, no duplicate line, no 500.
+
+Ruff clean. All test data — temporary products and every cart — was removed afterwards and the
+removal confirmed by count: `carts` 0, `cart_items` 0, `products` 1, `users` 2.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** A cart links a **customer identity** to purchasing intent,
+  which is personal data under PDPL and the UAE/Bahrain equivalents. No payment or identity
+  document data is involved. Carts remain working state with **no retention policy**, so
+  abandoned carts would accumulate indefinitely — still an open item.
+- **Security:** This is the step where cart access control exists, and it is structural rather
+  than procedural: no cart id or user id is accepted from the request, so there is no parameter
+  to tamper with. Ownership isolation was proven by driving two authenticated users against
+  each other's carts. Unknown request fields are rejected rather than ignored. `MAX_QUANTITY`
+  bounds a single line so repeated adds cannot overflow a PostgreSQL integer.
+- **Data residency / cross-border:** None. Local Docker PostgreSQL on `127.0.0.1:5433`. All
+  test data synthetic.
+- **Required controls / approvals:** Cart mutations are not rate limited, so a customer can
+  issue unbounded adds against their own cart — bounded in effect by `MAX_QUANTITY` but not in
+  request volume. Folds into the rate-limiting work at Step 63. Retention policy for abandoned
+  carts still required before production. Steps 39–40 must preserve the no-stored-price rule.
+- **Residual risk:** **Low.** Access control is structural and proven, the concurrency defect
+  found here is closed and demonstrated closed, and no financial or payment data is handled.
 
 ---
 
