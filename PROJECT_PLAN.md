@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 35 — Explain transactions, row locking / conditional updates, race conditions** (Steps 1–34 complete) |
-| **Phases complete** | 5 of 12 |
-| **Steps complete** | 34 of 74 |
+| **Current step** | **Step 36 — Cart and cart-item models** (Steps 1–35 complete, Phase 6 done) |
+| **Phases complete** | 6 of 12 |
+| **Steps complete** | 35 of 74 |
 
 ### Goals
 
@@ -219,13 +219,13 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 32 | Inventory and stock quantities | ✅ |
 | 33 | Stock adjustment and availability rules | ✅ |
 | 34 | Prevent negative inventory, handle concurrent stock changes | ✅ |
-| 35 | Explain transactions, row locking / conditional updates, race conditions | 🔵 |
+| 35 | Explain transactions, row locking / conditional updates, race conditions | ✅ |
 
 ### Phase 7 — Shopping Cart
 
 | # | Step | Status |
 |---|---|---|
-| 36 | Cart and cart-item models | ⬜ |
+| 36 | Cart and cart-item models | 🔵 |
 | 37 | Cart retrieval and item management endpoints | ⬜ |
 | 38 | Quantity changes and item removal | ⬜ |
 | 39 | Price and availability handling in a cart | ⬜ |
@@ -3045,6 +3045,124 @@ creating it.
 - No `lock_timeout` / `statement_timeout` configured; a stuck transaction can block sales of
   one product indefinitely. Should be set before Step 71 (deployment).
 - No monitoring of lock waits or long-running transactions.
+
+---
+
+### ✅ Step 35 — Transactions, Row Locking, Conditional Updates and Race Conditions
+
+**Completed:** 2026-10-29 · No code change. No migration. Explanation step, with every claim
+demonstrated against the real database.
+
+#### 1. A transaction is a boundary, not a keyword
+
+Everything between `BEGIN` and `COMMIT` lands completely or not at all. In this codebase the
+boundary is owned by **one layer only**: the service calls `commit()`, the repository never
+does, and `get_db()` closes the session afterwards — which rolls back anything uncommitted.
+
+That is why `create_product` calls `db.rollback()` before raising, and why Step 34 added a
+rollback before `InsufficientStockError`: leaving a transaction open holds its locks.
+
+#### 2. `READ COMMITTED` promises less than people assume
+
+PostgreSQL's default isolation level. Demonstrated:
+
+```
+0.00s  A   UPDATE sent to the database, NOT committed
+0.01s  B   sees 100 - not 42. A's change does not exist yet for anyone else
+0.01s  A   rolled back; the 42 never existed
+```
+
+It guarantees you never read **uncommitted** data. It does **not** guarantee that a value you
+read is still true when you write. Every statement sees a fresh snapshot, so two statements in
+one transaction can see different worlds. That gap is the whole of Step 34's bug.
+
+#### 3. What `FOR UPDATE` actually does
+
+```
+0.01s  A        locked the row, read 100
+0.30s  B        asks for the same row ... waiting
+1.02s  reader   plain SELECT returned 100 immediately, never blocked
+2.02s  A        wrote 99 and committed, lock released
+2.02s  B        got the lock, read 99  <- A's value, not the stale 100
+```
+
+Three things worth keeping:
+
+- B **waits**, then reads the value A wrote. It does not get a stale copy.
+- A plain `SELECT` is **never blocked** by a writer. In PostgreSQL readers and writers do not
+  block each other; only `FOR UPDATE` queues behind `FOR UPDATE`.
+- The lock lives until commit **or rollback**, not until the end of the statement.
+
+#### 4. Pessimistic versus optimistic versus conditional
+
+| Approach | How | Cost | Suits |
+|---|---|---|---|
+| Pessimistic (`FOR UPDATE`) | take the lock, then think | holds a lock across application code | several rows at once; needs the current value to decide — **what this project uses** |
+| Conditional `UPDATE` | `SET x = x + :d WHERE ... AND x + :d >= 0` | returns only a row count | a single counter |
+| Optimistic (`version` column) | write with `WHERE version = :seen`, retry on 0 rows | needs retry logic and a column | long think-time, rare conflicts |
+
+None is more "correct". The project uses the locking read because checkout must hold several
+products at once and because the error message needs the current quantity.
+
+#### 5. Deadlock, and the rule that prevents it
+
+Two orders, two products, locks taken in whatever order the cart happened to be in:
+
+```
+0.01s  order-1  locked product 32
+0.02s  order-2  locked product 33
+1.52s  order-1  FAILED - OperationalError      <- PostgreSQL killed one to break the cycle
+1.52s  order-2  locked product 32
+1.53s  order-2  committed
+```
+
+The same two orders, both locking in **id order**:
+
+```
+-> 0 transaction(s) killed: none
+```
+
+**Rule for Phase 7:** when an operation locks more than one row, sort the ids first and lock in
+that order, always. A deadlock is not a database fault; it is two transactions disagreeing
+about sequence. PostgreSQL detects the cycle and kills one — correct, but one customer sees a
+failure for no reason they could have caused.
+
+#### 6. `lock_timeout` — the control Step 34 recorded as missing
+
+```
+0.00s  holder     holds the lock for 3s
+0.31s  impatient  lock_timeout = 500ms, asking for the row
+0.82s  impatient  gave up after 0.51s with OperationalError
+```
+
+Without it a request waits indefinitely for a row another transaction is holding. One stuck
+transaction can then block every sale of a popular product, and the waiting requests consume
+connections from a finite pool while they wait — so one slow row can exhaust the pool and take
+down endpoints that have nothing to do with stock.
+
+Still **not configured**. Carried as an open item to the configuration-hardening step; it is a
+connection-level setting, not a code change at the call site.
+
+#### Verification
+
+All four demonstrations were run against the live database and the live schema. Stock was
+restored to its prior value afterwards, and the two temporary products created for the
+deadlock demonstration were deleted.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** None. No schema, code or data change persists from this
+  step; two temporary product rows were created and removed.
+- **Security:** Neutral to positive. No new surface. Documents a known availability failure
+  mode (unbounded lock waits exhausting the connection pool) and the deadlock-ordering rule
+  that prevents spurious transaction failures in checkout.
+- **Data residency / cross-border:** None. Local Docker PostgreSQL on `127.0.0.1:5433`.
+- **Required controls / approvals:** Unchanged from Step 34. `lock_timeout` and
+  `statement_timeout` remain required before production, and lock-wait monitoring remains
+  absent. The deadlock-ordering rule must be applied when Phase 7 locks several products in
+  one transaction.
+- **Residual risk:** **Low.** This step adds no attack surface and changes no behaviour. The
+  risks it describes are inherited from Step 34 and already tracked.
 
 ---
 
