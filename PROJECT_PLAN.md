@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 43 — Shipping and checkout data contracts** (Steps 1–42 complete) |
+| **Current step** | **Step 44 — Order creation design with transaction boundaries** (Steps 1–43 complete) |
 | **Phases complete** | 7 of 12 |
-| **Steps complete** | 42 of 74 |
+| **Steps complete** | 43 of 74 |
 
 ### Goals
 
@@ -237,8 +237,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 |---|---|---|
 | 41 | Customer addresses | ✅ |
 | 42 | Associate addresses with users | ✅ |
-| 43 | Shipping and checkout data contracts | 🔵 |
-| 44 | Order creation design with transaction boundaries | ⬜ |
+| 43 | Shipping and checkout data contracts | ✅ |
+| 44 | Order creation design with transaction boundaries | 🔵 |
 
 ### Phase 9 — Orders and Checkout
 
@@ -4021,6 +4021,138 @@ Ruff clean. All test data removed; `addresses` 0, `users` 2.
 
 - Address endpoints are not rate limited; enumeration attempts against `GET /addresses/{id}`
   are neither throttled nor logged.
+
+---
+
+### ✅ Step 43 — Shipping and Checkout Data Contracts
+
+**Completed:** 2026-10-31 · Phase 8 complete. No migration. No new dependency. Shapes only —
+no models and no endpoints.
+
+#### Decision: the checkout request is one field
+
+```json
+{"address_id": 7}
+```
+
+No items, no quantities, no prices, no total, no user. Every one of those already exists on
+the server: the cart rows, `products.price`, the arithmetic, and the token.
+
+| What a naive API accepts | Where it actually comes from |
+|---|---|
+| `items` | the customer's cart rows |
+| `unit_price` | `products.price`, read under lock |
+| `total` | computed server-side |
+| `user_id` | the token |
+| `shipping_address` | copied from `addresses`, scoped to the user |
+
+A field a client can send is a field an attacker can set, so the shortest request is the
+safest one. `address_id` is the single exception and is safe only because it resolves against
+that customer's own addresses — an id belonging to someone else does not match, so it cannot
+be used to post a parcel to an address the caller cannot already see.
+
+#### Decision: `ShippingAddress` is a copy, not a pointer
+
+Eight fields: `recipient_name`, `phone`, `line1`, `line2`, `city`, `region`, `postal_code`,
+`country`.
+
+Deliberately absent: `id`, `user_id`, `label`, `is_default`, `created_at`, `updated_at`. None
+of those describe where a parcel went. Keeping the `id` in particular would invite someone to
+follow it back to the live row, which is precisely the staleness the copy exists to prevent.
+
+The same reasoning as `order_items.unit_price`: `products.price` means *what this costs
+today*, and a shipping address means *where this parcel was sent*, which must stay true
+forever.
+
+It lives in `app/modules/addresses/schemas.py` rather than the orders module, because it is an
+address shape and address knowledge belongs with addresses. Orders import it.
+
+#### Decision: the snapshot is taken through `get_address`
+
+`snapshot_for_shipping` calls the same ownership-scoped lookup every other address operation
+uses, so an id belonging to someone else raises `NotFoundError` here exactly as it does
+elsewhere. Checkout must never reach around this and read the row directly.
+
+#### Decision: order read shapes and statuses are *not* defined here
+
+They arrive in Step 45 beside `models.py`, so the status values are defined once next to the
+check constraint that enforces them rather than twice in two modules. `app/modules/orders/`
+exists now holding only `CheckoutRequest`.
+
+#### Deliberately deferred: the idempotency key
+
+A double-submitted checkout creating two orders is a real problem, not a hypothetical one. The
+field is **not** added now because the mechanism behind it belongs to Steps 47 and 52, and a
+field with no mechanism is half a feature that looks like a whole one. Recorded as an open
+item, and noted that adding it later changes this contract.
+
+#### Files added or changed
+
+| File | Change |
+|---|---|
+| `app/modules/addresses/schemas.py` | `ShippingAddress` |
+| `app/modules/addresses/service.py` | `snapshot_for_shipping` |
+| `app/modules/orders/__init__.py` | module marker |
+| `app/modules/orders/schemas.py` | `CheckoutRequest` |
+
+#### Verification
+
+25 of 25 contract assertions, against the schemas directly:
+
+- `address_id` alone is accepted and is the only field present
+- `items`, `total`, `unit_price`, `price`, `user_id`, `status` and `shipping_address` are each
+  rejected by name
+- `address_id` is required and must be positive
+- `ShippingAddress` carries all eight shipping fields and none of `id`, `user_id`,
+  `is_default`, `label`, `created_at`, `updated_at`
+
+7 of 7 behavioural assertions against the live database, which is where the point of a
+snapshot actually shows:
+
+| Case | Result |
+|---|---|
+| snapshot taken from a real address | `Original Person, 1 Old Street` |
+| customer then edits the address | live row becomes `99 New Street` |
+| the snapshot | **unchanged** — line, recipient and country all still the originals |
+| customer then deletes the address | the snapshot still reads `1 Old Street` |
+| snapshotting another customer's address | `NotFoundError: Address 37 does not exist` |
+
+The edit and the delete are the whole argument for copying rather than referencing, and they
+were run rather than asserted. Ruff clean; no test data left behind.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** The snapshot **duplicates personal data** — a second copy
+  of a delivery address and phone number that a customer's `DELETE /addresses/{id}` will not
+  reach, proven above. That is deliberate and necessary, since an order must record where a
+  parcel was actually sent, but it means a customer erasure request cannot be satisfied by
+  deleting the address book alone. Order retention is a separate decision with a different
+  basis: commercial and tax records are normally retained for a fixed statutory period, so the
+  lawful position is retention-with-justification rather than deletion. Required before
+  production, not optional, and now the single most important data-protection item open in the
+  project.
+- **Security:** The contract closes the injection surface structurally rather than by
+  validation — there is no money, no user and no item field to attack, proven by rejecting
+  seven of them by name. The one id a client may send is resolved through the same
+  ownership-scoped lookup as every other address read, so checkout cannot ship to an address
+  the caller cannot already see.
+- **Data residency / cross-border:** Unchanged, and now slightly wider: once orders exist, the
+  same personal data sits in two tables, so any residency assessment, backup scope or analytics
+  export must cover `orders` as well as `addresses`.
+- **Required controls / approvals:** Retention policy for order-held personal data, with the
+  statutory basis stated. An erasure procedure that accounts for snapshots, rather than
+  assuming address deletion suffices. Both carried into Phase 9 and neither is optional.
+  Existing items unchanged: encryption at rest, log masking, rate limiting.
+- **Residual risk:** **Low** for this step as written, since nothing is stored yet and the
+  contracts narrow rather than widen what is accepted. It becomes **Medium** the moment orders
+  persist, on the retention and erasure gap above rather than on anything in the request path.
+
+#### Open items added
+
+- Order-held personal data will not be reached by customer-initiated address deletion; an
+  erasure procedure covering snapshots is required.
+- No idempotency key on the checkout contract; a double-submitted checkout would create two
+  orders. Steps 47 and 52, and adding it will change this contract.
 
 ---
 

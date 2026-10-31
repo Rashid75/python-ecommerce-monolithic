@@ -75,3 +75,32 @@ class AddressRead(BaseModel):
     is_default: bool
     created_at: datetime
     updated_at: datetime
+
+
+class ShippingAddress(BaseModel):
+    """An address as an order keeps it: a copy, frozen at checkout.
+
+    Lives here rather than in the orders module because it is an address
+    shape, and address knowledge belongs with addresses. Orders import it.
+
+    Deliberately missing: id, user_id, label, is_default, created_at,
+    updated_at. None of those describe where a parcel went. Keeping the id
+    in particular would invite someone to follow it back to the live row,
+    which is exactly the staleness this copy exists to prevent - the
+    customer may since have edited or deleted it.
+
+    The same reasoning as order_items.unit_price. products.price means what
+    this costs today; a shipping address means where this parcel was sent,
+    and that must stay true forever.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    recipient_name: str
+    phone: str
+    line1: str
+    line2: str | None
+    city: str
+    region: str | None
+    postal_code: str | None
+    country: str

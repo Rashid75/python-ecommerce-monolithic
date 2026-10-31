@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import NotFoundError, ValidationError
 from app.modules.addresses import repository as repo
 from app.modules.addresses.models import MAX_ADDRESSES_PER_USER, Address
-from app.modules.addresses.schemas import AddressCreate, AddressUpdate
+from app.modules.addresses.schemas import AddressCreate, AddressUpdate, ShippingAddress
 from app.modules.users.models import User
 
 
@@ -110,3 +110,16 @@ def delete_address(db: Session, user_id: int, address_id: int) -> None:
         if remaining:
             remaining[0].is_default = True
     db.commit()
+
+
+def snapshot_for_shipping(db: Session, user_id: int, address_id: int) -> ShippingAddress:
+    """Take a frozen copy of one of this customer's addresses.
+
+    Goes through get_address, so an address id belonging to someone else
+    raises NotFoundError exactly as it would anywhere else. Checkout must
+    never reach around this and read the row directly.
+
+    The caller stores the result. It does not change again, whatever the
+    customer later does to their address book.
+    """
+    return ShippingAddress.model_validate(get_address(db, user_id, address_id))
