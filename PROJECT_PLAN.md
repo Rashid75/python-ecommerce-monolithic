@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 45 — Order and order-item models** (Steps 1–44 complete, Phase 8 done) |
+| **Current step** | **Step 46 — Immutable order-item snapshots** (Steps 1–45 complete) |
 | **Phases complete** | 8 of 12 |
-| **Steps complete** | 44 of 74 |
+| **Steps complete** | 45 of 74 |
 
 ### Goals
 
@@ -244,8 +244,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 
 | # | Step | Status |
 |---|---|---|
-| 45 | Order and order-item models | 🔵 |
-| 46 | Immutable order-item snapshots (name, SKU, quantity, unit price) | ⬜ |
+| 45 | Order and order-item models | ✅ |
+| 46 | Immutable order-item snapshots (name, SKU, quantity, unit price) | 🔵 |
 | 47 | Checkout and order creation | ⬜ |
 | 48 | Validate inventory, atomic stock updates | ⬜ |
 | 49 | Order statuses and valid state transitions | ⬜ |
@@ -4301,6 +4301,130 @@ removed.
   assessment before any integration.
 
 ---
+
+### ✅ Step 45 — Order and Order-Item Models
+
+**Completed:** 2026-10-31 · Phase 9 begins. One migration, applied. No endpoints and no checkout
+logic — those are Steps 47–50.
+
+#### The change in the rules
+
+Everything before this step was working state. An order is a record, and the rules invert:
+
+| | Cart / address | Order |
+|---|---|---|
+| May be edited later | yes | no |
+| Deleted with the user | yes (CASCADE) | **no (RESTRICT)** |
+| Reads today's price | yes | **never — its own copy** |
+| Reads the live address | yes | **never — its own copy** |
+
+#### Decisions
+
+**The address is eight flat columns, copied.** Not a foreign key — Step 43 demonstrated the
+staleness — and not JSON, so the columns can be indexed, constrained and read in `psql` without
+JSON operators. Nullable exactly where `Address` is nullable.
+
+**`orders.user_id` is `ON DELETE RESTRICT`.** Carts and addresses CASCADE; a financial record
+must not. The consequence is deliberate and now live: **a customer who has ordered cannot be
+deleted.**
+
+**`total_amount` is stored.** It is what was charged, a fact about money that moved, not
+arithmetic to redo on every read. Recomputing it would let a future rounding change silently
+rewrite history. `NUMERIC(12,2)`, never float.
+
+**Order items have no `created_at` or `updated_at`.** An item never changes, so `updated_at`
+could only repeat its creation time, and its creation time is already its order's.
+
+**`status` has no `server_default`.** Whoever creates an order states its state in the calling
+code, where it can be seen. The check constraint makes a typo impossible.
+
+**The status list is written once:**
+
+```python
+OrderStatus = Literal["pending", "paid", "shipped", "delivered", "cancelled"]
+ORDER_STATUSES: tuple[str, ...] = get_args(OrderStatus)
+```
+
+`get_args` reads the values back off the type, so the API type and the check constraint are the
+same list and cannot drift. Which moves between statuses are legal is Step 49.
+
+**No `cascade="all, delete-orphan"` on `Order.items`**, unlike `Cart.items`. Removing a line
+from an order should not be possible, so the ORM is given no quiet way to do it: deleting an
+`Order` through the session would try to null the children's `order_id` and fail loudly.
+
+#### Files added or changed
+
+| File | Change |
+|---|---|
+| `app/modules/orders/models.py` | `Order`, `OrderItem`, `OrderStatus`, `ORDER_STATUSES` |
+| `app/modules/orders/schemas.py` | `OrderItemRead`, `OrderRead` |
+| `alembic/env.py` | imports the two new models |
+| `alembic/versions/..._add_orders_and_order_items.py` | the migration |
+
+`OrderRead.from_order()` is written out by hand because the eight shipping columns are flat on
+the table and nested under `shipping` in the API. An explicit function reading
+`order.shipping_city` is easier to follow than a validator that rearranges fields invisibly.
+
+`OrderItemRead.line_total` is **computed**, not stored — both inputs are frozen snapshots, so it
+can only ever give the same answer. `Order.total_amount` is the opposite case.
+
+#### Verification
+
+Autogenerate rendered both check constraints, because this is a `create_table` path rather than
+the `add_column` path that silently dropped one in Step 32. `alembic check` afterwards: *No new
+upgrade operations detected.*
+
+10 of 10 behavioural assertions against the applied schema:
+
+| Case | Result |
+|---|---|
+| status `'refunded'` | refused — `ck_orders_status_is_known` |
+| `total_amount` −1 | refused — `ck_orders_total_not_negative` |
+| an order with one line | created, total 39.98 |
+| a second line for the same product | refused — `uq_order_items_order_id_product_id` |
+| a line of quantity 0 | refused — `ck_order_items_quantity_is_positive` |
+| deleting the customer who ordered | refused — RESTRICT on `fk_orders_user_id_users` |
+| deleting the product that was sold | refused — RESTRICT on `fk_order_items_product_id_products` |
+| `OrderRead` shipping | nested, eight fields |
+| `OrderRead` | no `user_id` |
+| `line_total` | 39.98, computed |
+
+Ruff clean; no test data left behind.
+
+Note for reading `\d orders`: PostgreSQL rewrites `status IN (...)` into
+`status::text = ANY (ARRAY[...])` when it stores the constraint. It means the same thing.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** This step **creates a second store of personal data**.
+  Recipient name, phone and full address now live in `orders` as well as `addresses`, and the
+  RESTRICT above means a customer with orders cannot be deleted at all — demonstrated, not
+  assumed. That is correct for a financial record under commercial and tax retention, but it
+  converts the Step 43 item from a design note into a live obligation: an erasure request can no
+  longer be satisfied by deleting rows, so a documented retention basis and an erasure procedure
+  that distinguishes order data from address-book data are now required.
+- **Security:** `OrderRead` omits `user_id`, as `AddressRead` does. No endpoints exist yet, so
+  there is no access path to review — ownership scoping on order reads is Step 51 and must not
+  be skipped, since order ids are sequential and an unscoped `GET /orders/{id}` is a textbook
+  IDOR.
+- **Data residency / cross-border:** Widened as predicted in Step 43. Any residency assessment,
+  backup scope, replica or analytics export must now cover `orders` and `order_items`.
+  `order_items` also holds purchase history, which is behavioural data about a person and is
+  often more sensitive in aggregate than a single address.
+- **Required controls / approvals:** Retention policy with its statutory basis, before
+  production. Encryption at rest and log masking now apply to two more tables. New item: **the
+  schema assumes a single currency** — no currency column on `products` or `orders` — which is a
+  real constraint for a KSA/UAE/Bahrain footprint and must be decided before launch rather than
+  retrofitted across stored totals.
+- **Residual risk:** **Medium**, up from Low, and the increase is the point: data is now stored
+  that deletion will not reach. The schema is sound; the risk is the policy gap it makes
+  concrete.
+
+#### Open items added
+
+- A customer with orders cannot be deleted. Erasure now requires a documented procedure that
+  separates order data from address-book data; deleting rows is no longer an option.
+- Single-currency assumption, undeclared anywhere in the schema. Decide before launch.
 
 ## 7. Standing Security & Compliance Commitments
 

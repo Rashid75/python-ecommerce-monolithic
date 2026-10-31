@@ -1,11 +1,21 @@
-"""What checkout accepts.
+"""What checkout accepts, and what an order looks like on the way out.
 
-Only the request contract lives here for now. Order models arrive in Step
-45 and the order read shapes with them, so that the statuses are defined
-once, beside the check constraint that enforces them, rather than twice.
+The request contract and the read shapes. The statuses themselves live in
+models.py, beside the check constraint that enforces them, so that they
+are written down once rather than twice.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from datetime import datetime
+from decimal import Decimal
+from typing import TYPE_CHECKING
+
+from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+from app.modules.addresses.schemas import ShippingAddress
+from app.modules.orders.models import OrderStatus
+
+if TYPE_CHECKING:
+    from app.modules.orders.models import Order
 
 
 class CheckoutRequest(BaseModel):
@@ -25,3 +35,79 @@ class CheckoutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     address_id: int = Field(gt=0)
+
+
+class OrderItemRead(BaseModel):
+    """One line of an order, exactly as it was bought.
+
+    Every field here is the snapshot, not the live product. product_id is
+    carried so a client can link back to the catalogue page, but nothing
+    on this line is read from it.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    product_id: int
+    sku: str
+    name: str
+    unit_price: Decimal
+    quantity: int
+
+    @computed_field
+    @property
+    def line_total(self) -> Decimal:
+        """unit_price x quantity.
+
+        Computed rather than stored, unlike the order's total_amount. The
+        inputs are both frozen snapshots, so this can only ever give the
+        same answer - there is no history to lose. The order's total is
+        different: it is what was charged, which must not be recomputed.
+        """
+        return self.unit_price * self.quantity
+
+
+class OrderRead(BaseModel):
+    """An order as a customer sees it.
+
+    No user_id: the caller is the owner, and repeating their id tells them
+    nothing they do not know while handing an attacker a number to try.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    status: OrderStatus
+    total_amount: Decimal
+    shipping: ShippingAddress
+    items: list[OrderItemRead]
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_order(cls, order: "Order") -> "OrderRead":
+        """Build the response from an Order row.
+
+        Written out by hand because the eight shipping columns are flat on
+        the table - shipping_city and so on - while the API nests them
+        under one shipping object. Something has to bridge the two, and an
+        explicit function is easier to follow than a validator that
+        rearranges fields invisibly.
+        """
+        return cls(
+            id=order.id,
+            status=order.status,
+            total_amount=order.total_amount,
+            shipping=ShippingAddress(
+                recipient_name=order.shipping_recipient_name,
+                phone=order.shipping_phone,
+                line1=order.shipping_line1,
+                line2=order.shipping_line2,
+                city=order.shipping_city,
+                region=order.shipping_region,
+                postal_code=order.shipping_postal_code,
+                country=order.shipping_country,
+            ),
+            items=[OrderItemRead.model_validate(item) for item in order.items],
+            created_at=order.created_at,
+            updated_at=order.updated_at,
+        )
