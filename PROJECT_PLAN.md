@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 41 — Customer addresses** (Steps 1–40 complete, Phase 7 done) |
+| **Current step** | **Step 42 — Associate addresses with users** (Steps 1–41 complete) |
 | **Phases complete** | 7 of 12 |
-| **Steps complete** | 40 of 74 |
+| **Steps complete** | 41 of 74 |
 
 ### Goals
 
@@ -235,8 +235,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 
 | # | Step | Status |
 |---|---|---|
-| 41 | Customer addresses | 🔵 |
-| 42 | Associate addresses with users | ⬜ |
+| 41 | Customer addresses | ✅ |
+| 42 | Associate addresses with users | 🔵 |
 | 43 | Shipping and checkout data contracts | ⬜ |
 | 44 | Order creation design with transaction boundaries | ⬜ |
 
@@ -3761,6 +3761,141 @@ was changed in this step. All test data removed.
 
 - No audit trail for price changes; a disputed charge cannot be reconstructed. Must be covered
   by Step 60.
+
+---
+
+### ✅ Step 41 — Customer Addresses
+
+**Completed:** 2026-10-31 · Phase 8 begins. Migration generated and run by the user.
+
+`app/modules/addresses/models.py` with one table, `addresses`. Model only; endpoints are
+Step 42.
+
+#### Decision: an address book, not a record — orders will copy, never reference
+
+The same shape as the price decision in Step 40.
+
+| | Price | Address |
+|---|---|---|
+| Lives in | `products.price` | `addresses` |
+| Changed by | an admin, at any time | the customer, at any time |
+| An order needs | what they agreed to pay | where it was actually sent |
+| Solution | copy into `order_items` | **copy into `orders`** |
+
+An order holding `address_id` would have its shipping address silently rewritten when the
+customer later corrected a typo, and nobody could answer where the parcel was actually sent.
+Phase 9 must snapshot the fields, and `orders` must have **no foreign key to `addresses`**.
+
+That is also what makes `ON DELETE CASCADE` on `user_id` safe here: deleting a customer takes
+their personal data with it without stranding an order.
+
+#### Decision: one default per customer, enforced by a partial unique index
+
+```sql
+CREATE UNIQUE INDEX uq_addresses_user_id_default ON addresses (user_id) WHERE is_default
+```
+
+Unique across the rows where `is_default` is true, silent about the rest. Two simultaneous
+requests cannot both set a default; the database decides, as with the SKU index and the
+cart-line index.
+
+A plain unique index on `(user_id, is_default)` would be wrong in a way that is easy to miss:
+it would allow only **one non-default address** per customer, which is the opposite of the
+intended rule.
+
+#### Decision: what is stored, and what deliberately is not
+
+Fourteen columns, and nothing fulfilment does not need. Notable choices:
+
+- `country` is `VARCHAR(2)`, ISO 3166-1 alpha-2, upper case — so "UAE", "U.A.E." and "United
+  Arab Emirates" cannot all mean the same place.
+- `postal_code` and `region` are **optional**. Postal codes are not universally used or
+  required across KSA, the UAE and Bahrain, and demanding one would make valid addresses
+  unenterable.
+- `recipient_name` is separate from the account holder's name, because the person receiving a
+  parcel is often not the person who ordered it.
+- `phone` is stored as typed. Normalising to E.164 would be better for dialling but needs a
+  library that knows every country's numbering plan, and a wrong "correction" to a delivery
+  number is worse than an unformatted one.
+- `MAX_ADDRESSES_PER_USER = 20`, enforced in the service at Step 42. A data-protection limit
+  rather than a business rule: personal data should not accumulate without bound.
+
+No national identifier, date of birth, or any other identity-document field. Nothing here
+requires one.
+
+#### Files added or changed
+
+| File | Change |
+|---|---|
+| `app/modules/addresses/__init__.py` | module marker |
+| `app/modules/addresses/models.py` | `Address`, `MAX_ADDRESSES_PER_USER` |
+| `alembic/env.py` | imports `Address` so autogenerate sees it |
+
+#### Verification
+
+Compiled DDL inspected before the migration was generated: all fourteen columns, the FK with
+`ON DELETE CASCADE`, the FK index, and the partial unique index with its `WHERE is_default`
+clause. Ruff clean.
+
+Migration `786dd9382dba` needed no hand edit. Autogenerate kept
+`postgresql_where=sa.text('is_default')` on both the create and the drop, which it needs in
+order to identify the right index. No check constraints in this table, so the Step 30 and 32
+trap does not apply here. `alembic check` then reported no drift.
+
+Behaviour verified against the migrated database:
+
+| Case | Result |
+|---|---|
+| a customer may have a default address | allowed |
+| a **second** default for that customer | refused, `uq_addresses_user_id_default` |
+| three further **non-default** addresses alongside it | allowed, 4 rows total |
+| another customer's own default | allowed |
+| a three-letter country code | refused, `DataError` |
+| deleting a user | their addresses go, the other customer's stay |
+
+The third row is the one that matters. A plain unique index on `(user_id, is_default)` would
+have refused the second non-default address — the exact failure mode predicted before the
+index was written, confirmed by allowing it rather than by reasoning about it.
+
+Synthetic test data only, removed afterwards; no addresses left behind.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** **The most sensitive table in the project so far.** Every
+  column is personal data under PDPL and the UAE and Bahrain equivalents, and a delivery
+  address plus a phone number is directly identifying and locating. Collection is limited to
+  what fulfilment needs, with no identity-document or date-of-birth fields. `ON DELETE CASCADE`
+  gives a working deletion path when a user is removed. Retention is **not** addressed: there
+  is no rule saying how long an address book is kept after a customer stops ordering, and that
+  is now a required control rather than an observation.
+- **Security:** No endpoint yet, so no surface. The rule for Step 42 is fixed now and is the
+  same structural one used for carts: addresses are reachable only through the authenticated
+  user, never by an id in a path that a client could change. An address id in a URL would be a
+  direct IDOR onto home addresses, which is the worst-consequence version of that bug in this
+  codebase. Admin read access for fulfilment is **not** granted and must be designed
+  deliberately when Phase 9 needs it, with least privilege and logging, rather than falling out
+  of a generic admin role.
+- **Data residency / cross-border:** None today — local Docker PostgreSQL on `127.0.0.1:5433`.
+  This is the table that makes residency a live question for production: addresses of KSA data
+  subjects are expected to remain in approved locations, and any backup, analytics copy, log
+  export or third-party fulfilment integration carrying this table is a cross-border transfer
+  that needs assessment. Flagged now, before the data exists, rather than after.
+- **Required controls / approvals:** Retention and deletion policy for addresses. Encryption at
+  rest for the database holding them. Access review for any admin path that can read them.
+  Masking in logs — no address field may ever be written to an application log or an error
+  response. Residency assessment before any non-local deployment.
+- **Residual risk:** **Medium.** The schema is minimal and the deletion path works, but the
+  table holds directly identifying location data with no retention rule, no encryption-at-rest
+  decision recorded, and no logging or masking controls yet. It drops to Low once Step 42
+  lands the ownership-scoped endpoints and the controls above are in place.
+
+#### Open items added
+
+- No retention or deletion policy for addresses after a customer stops ordering.
+- No encryption-at-rest decision recorded for the database holding addresses.
+- No log-masking rule for address fields.
+- Admin read access to customer addresses must be designed deliberately in Phase 9, not
+  inherited from the generic admin role.
 
 ---
 

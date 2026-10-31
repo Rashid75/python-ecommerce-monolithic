@@ -17,6 +17,7 @@ from app.db.base import Base
 # Importing a model module registers its table on Base.metadata.
 # EVERY new model must be added here, or autogenerate will not see it and
 # will quietly produce an empty migration.
+from app.modules.addresses.models import Address  # noqa: F401
 from app.modules.cart.models import Cart, CartItem  # noqa: F401
 from app.modules.categories.models import Category  # noqa: F401
 from app.modules.products.models import Product  # noqa: F401
