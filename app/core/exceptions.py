@@ -49,3 +49,13 @@ class ValidationError(AppError):
     The router maps this to 422. Distinct from Pydantic's own 422, which
     rejects a request before any rule is consulted.
     """
+
+
+class UnavailableError(AppError):
+    """The product cannot be bought in the quantity asked for.
+
+    Covers both causes - the product is no longer on sale, and there is not
+    enough stock - because the router maps both to 409 and the message says
+    which. Distinct from InsufficientStockError, which belongs to stock
+    adjustments and means an admin tried to remove more than exists.
+    """

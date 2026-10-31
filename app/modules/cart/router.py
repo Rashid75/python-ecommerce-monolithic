@@ -9,7 +9,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, status
 
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import NotFoundError, UnavailableError, ValidationError
 from app.db.session import DbSession
 from app.modules.cart import service
 from app.modules.cart.models import Cart
@@ -38,6 +38,9 @@ def _to_read(cart: Cart) -> CartRead:
             quantity=item.quantity,
             unit_price=item.product.price,
             line_total=item.product.price * item.quantity,
+            is_active=item.product.is_active,
+            available_stock=item.product.stock_quantity,
+            issue=service.line_issue(item),
         )
         for item in cart.items
     ]
@@ -47,6 +50,7 @@ def _to_read(cart: Cart) -> CartRead:
         # Decimal("0") as the start value, so an empty cart totals Decimal
         # rather than int and the type stays consistent.
         total=sum((item.line_total for item in items), Decimal("0")),
+        has_issues=any(item.issue is not None for item in items),
     )
 
 
@@ -64,6 +68,10 @@ def add_item(data: CartItemAdd, user: CurrentUser, db: DbSession) -> CartRead:
         cart = service.add_item(db, user.id, data.product_id, data.quantity)
     except NotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except UnavailableError as exc:
+        # 409, not 422: the request is well formed and the product exists.
+        # It conflicts with the product's current state.
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except ValidationError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     return _to_read(cart)
@@ -80,6 +88,8 @@ def set_item_quantity(
         cart = service.set_item_quantity(db, user.id, product_id, data.quantity)
     except NotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except UnavailableError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     return _to_read(cart)
 
 

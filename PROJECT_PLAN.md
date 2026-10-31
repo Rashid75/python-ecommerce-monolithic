@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 39 — Price and availability handling in a cart** (Steps 1–38 complete) |
+| **Current step** | **Step 40 — When to calculate prices and validate inventory** (Steps 1–39 complete) |
 | **Phases complete** | 6 of 12 |
-| **Steps complete** | 38 of 74 |
+| **Steps complete** | 39 of 74 |
 
 ### Goals
 
@@ -228,8 +228,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 36 | Cart and cart-item models | ✅ |
 | 37 | Cart retrieval and item management endpoints | ✅ |
 | 38 | Quantity changes and item removal | ✅ |
-| 39 | Price and availability handling in a cart | 🔵 |
-| 40 | When to calculate prices and validate inventory (never trust client prices) | ⬜ |
+| 39 | Price and availability handling in a cart | ✅ |
+| 40 | When to calculate prices and validate inventory (never trust client prices) | 🔵 |
 
 ### Phase 8 — Addresses and Checkout Preparation
 
@@ -3514,6 +3514,127 @@ Ruff clean. All test data removed; `carts` 0, `cart_items` 0, `products` 1, `use
 - **Residual risk:** **Low.** Ownership is enforced by construction and proven by test, the
   locking order follows the rule established in Step 37, and concurrent writes were shown to
   produce a value that was actually sent rather than a corrupted one.
+
+---
+
+### ✅ Step 39 — Price and Availability Handling in a Cart
+
+**Completed:** 2026-10-31 · No migration. No new dependency.
+
+Availability checks on the write paths, and per-line issue reporting on the read path.
+
+#### The price problem that does not exist
+
+The classic cart bug is a stale price: the item was added at 12.00, the price rose to 15.00,
+and the customer checks out at the old figure or is charged a different one from the one shown.
+
+That bug is impossible here. `cart_items` has no price column, so there is nothing to go stale,
+and the cart reads `products.price` on every request. The Step 36 decision removed the whole
+class of bug rather than managing it. There is deliberately no "price changed since you added
+this" warning, because there is nothing to compare against.
+
+#### The central rule: a cart check is a courtesy, not a reservation
+
+Refusing an add of 5 when 3 exist is helpful. Passing that check guarantees **nothing** —
+another customer can buy the last one a moment later, and the cart holds no claim on anything.
+
+Demonstrated rather than asserted. One product, stock 1, two customers:
+
+```
+product 52, stock 1
+customer A adds it   -> HTTP 200
+customer B adds it   -> HTTP 200
+stock afterwards     -> 1
+```
+
+Both succeeded and stock never moved. Exactly one of them can actually be sold it, and
+deciding which is the order transaction's job. Getting this backwards — treating the cart
+check as authoritative — is how real shops oversell.
+
+#### Decision: `GET /cart` never fails because of availability
+
+A cart holding an off-sale product still returns 200 and still lists the line. A customer
+whose cart cannot be read cannot fix it. Problems are reported per line, not by refusing the
+request.
+
+#### Decision: a short code, not a sentence
+
+`issue` is `"unavailable"`, `"insufficient_stock"` or `null`. The client chooses the wording
+and the translation, and the message is then free to change without breaking anyone.
+`is_active` and `available_stock` are reported alongside so a client can explain the problem
+rather than only report it.
+
+#### Decision: the total includes lines that cannot be bought
+
+`total` sums every line, matching what the customer can see listed. Quietly dropping a line
+from the total would make the arithmetic on screen look wrong. `has_issues` carries the
+signal instead, and checkout will refuse while it is true.
+
+#### Decision: the add check is against the resulting total
+
+Five adds of one each are refused at the same point as one add of five. Checking only what the
+request carried would let a customer walk past the limit one unit at a time.
+
+#### Decision: one `UnavailableError` for both causes
+
+Off sale and not enough stock both map to 409 — the request is well formed and the product
+exists, it conflicts with the product's current state. The message says which. Kept distinct
+from `InsufficientStockError`, which belongs to stock adjustments and means an admin tried to
+remove more than exists.
+
+#### Files changed
+
+| File | Change |
+|---|---|
+| `app/core/exceptions.py` | `UnavailableError` → 409 |
+| `app/modules/cart/schemas.py` | `is_active`, `available_stock`, `issue` on the line; `has_issues` on the cart |
+| `app/modules/cart/service.py` | `line_issue`, `_check_can_be_bought`; applied in `add_item` and `set_item_quantity` |
+| `app/modules/cart/router.py` | populates the new fields; maps `UnavailableError` to 409 |
+
+#### Verification
+
+23 of 23 assertions over HTTP against a running server:
+
+| Group | Cases |
+|---|---|
+| refusing at add | 5 when 3 exist → 409; an off-sale product → 409; exactly 3 → 200; one more making 4 → 409, proving the check is cumulative |
+| a healthy cart | `has_issues` false, `issue` null, `is_active` and `available_stock` reported |
+| product goes off sale | `GET` still 200; `issue` `unavailable`; `has_issues` true; the line still listed; total still counts it; `PUT` on that line → 409; `DELETE` of that line → 200 |
+| stock falls below the cart | `issue` `insufficient_stock`; `available_stock` shows 2; `has_issues` true |
+| fixing it | setting 3 when 2 exist → 409; setting 2 → 200; `issue` and `has_issues` both clear |
+
+Plus the no-reservation demonstration above.
+
+Note the pair in the third group: a line that cannot be bought can still be **removed** but not
+**changed**. Blocking removal would trap a customer with a cart they cannot check out and
+cannot repair.
+
+Ruff clean. All test data removed; `carts` 0, `cart_items` 0, `products` 1, `users` 2.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** Unchanged. No new personal data. Cart contents remain
+  personal data with no retention policy — still open.
+- **Security:** Availability responses disclose `available_stock` to any authenticated customer
+  who has the product in their cart. That is ordinary shop information and the figure is
+  already implicit in whether an add succeeds, so the disclosure is deliberate rather than
+  accidental. A competitor could poll it to track inventory; acceptable for a consumer
+  catalogue, and worth revisiting if stock levels ever become commercially sensitive. Recorded
+  as an open item rather than treated as settled.
+- **Data residency / cross-border:** None. Local Docker PostgreSQL on `127.0.0.1:5433`. All
+  test data synthetic.
+- **Required controls / approvals:** The cart check must **never** be mistaken for the
+  authoritative one. Phase 9 must re-check availability inside the order transaction while
+  holding the product row lock, and that check — not this one — is what prevents overselling.
+  This is the single most important carry-forward in Phase 7.
+- **Residual risk:** **Low** for this step in isolation, because nothing here is relied on for
+  correctness. It becomes **High** if checkout is later built on the assumption that a cart
+  without issues is safe to fulfil.
+
+#### Open items added
+
+- `available_stock` is visible to any authenticated customer with the product in their cart;
+  revisit if inventory levels become commercially sensitive.
 
 ---
 

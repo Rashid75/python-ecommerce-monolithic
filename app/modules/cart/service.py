@@ -7,11 +7,43 @@ name a cart, so it cannot name someone else's.
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import NotFoundError, UnavailableError, ValidationError
 from app.modules.cart import repository as repo
 from app.modules.cart.models import Cart, CartItem
 from app.modules.cart.schemas import MAX_QUANTITY
 from app.modules.products import repository as product_repo
+from app.modules.products.models import Product
+
+
+def line_issue(item: CartItem) -> str | None:
+    """Why this line cannot be bought, or None if it can.
+
+    Lives in the service because it is a business rule, even though the
+    router is what turns it into a field. The rule and the response shape
+    change for different reasons.
+    """
+    if not item.product.is_active:
+        return "unavailable"
+    if item.quantity > item.product.stock_quantity:
+        return "insufficient_stock"
+    return None
+
+
+def _check_can_be_bought(product: Product, quantity: int) -> None:
+    """Refuse a product that is off sale, or more of it than exists.
+
+    This is a courtesy, not a reservation. Passing it guarantees nothing:
+    another customer can buy the last one a moment later, and nothing here
+    is held. The check that counts is the one inside the order transaction,
+    holding the row lock. This one exists so the customer hears about an
+    obvious problem now rather than at checkout.
+    """
+    if not product.is_active:
+        raise UnavailableError(f"Product {product.id} is no longer on sale")
+    if quantity > product.stock_quantity:
+        raise UnavailableError(
+            f"Only {product.stock_quantity} of product {product.id} are available"
+        )
 
 
 def _ensure_cart_id(db: Session, user_id: int) -> int:
@@ -58,13 +90,9 @@ def get_cart(db: Session, user_id: int) -> Cart:
 
 
 def add_item(db: Session, user_id: int, product_id: int, quantity: int) -> Cart:
-    """Add a product to the cart, or add more of one already there.
-
-    Availability is deliberately not checked here. Whether the product is
-    active, and whether there is enough stock, are Steps 39 and 40 - those
-    are decisions about what to tell the customer, not arithmetic.
-    """
-    if product_repo.get_by_id(db, product_id) is None:
+    """Add a product to the cart, or add more of one already there."""
+    product = product_repo.get_by_id(db, product_id)
+    if product is None:
         raise NotFoundError(f"Product {product_id} does not exist")
 
     cart_id = _ensure_cart_id(db, user_id)
@@ -77,6 +105,9 @@ def add_item(db: Session, user_id: int, product_id: int, quantity: int) -> Cart:
 
     item = repo.get_item(db, cart_id, product_id)
     new_quantity = quantity if item is None else item.quantity + quantity
+    # Checked against the resulting total, not against what was sent. Five
+    # adds of one each must be refused at the same point as one add of five.
+    _check_can_be_bought(product, new_quantity)
     if new_quantity > MAX_QUANTITY:
         db.rollback()
         raise ValidationError(f"A cart line cannot hold more than {MAX_QUANTITY} of one product")
@@ -115,9 +146,15 @@ def set_item_quantity(db: Session, user_id: int, product_id: int, quantity: int)
 
     The product is not re-checked for existence: a line can only exist
     because the product did, and ON DELETE RESTRICT stops it disappearing
-    underneath. Whether it is still active or in stock is Step 39.
+    underneath.
     """
     _, item = _locked_item(db, user_id, product_id)
+    try:
+        _check_can_be_bought(item.product, quantity)
+    except UnavailableError:
+        # Release the lock, as on the not-found path above.
+        db.rollback()
+        raise
     item.quantity = quantity
     db.commit()
     return get_cart(db, user_id)

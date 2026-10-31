@@ -6,6 +6,7 @@ rather than read straight off one ORM object.
 """
 
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -59,8 +60,22 @@ class CartItemRead(BaseModel):
     quantity: int
     # The product's price right now, not a copy taken when the item was
     # added. Decimal throughout: money is never a float.
+    #
+    # There is no "price changed since you added this" warning, because
+    # there is nothing to compare against. Not storing the price removed
+    # that whole class of bug rather than managing it.
     unit_price: Decimal
     line_total: Decimal
+
+    # The product's current state, so a client can explain the problem
+    # rather than only report it.
+    is_active: bool
+    available_stock: int
+
+    # Why this line cannot be bought, or None if it can. A short code
+    # rather than a sentence: the client chooses the wording and the
+    # translation, and a message is free to change without breaking anyone.
+    issue: Literal["unavailable", "insufficient_stock"] | None = None
 
 
 class CartRead(BaseModel):
@@ -68,4 +83,9 @@ class CartRead(BaseModel):
 
     items: list[CartItemRead]
     total_items: int
+    # The sum of every line, including any that cannot currently be bought.
+    # It matches what the customer can see listed. Quietly dropping a line
+    # from the total would make the arithmetic on screen look wrong.
     total: Decimal
+    # True if any line has an issue. Checkout will refuse while it is true.
+    has_issues: bool
