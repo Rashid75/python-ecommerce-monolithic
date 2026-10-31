@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 40 — When to calculate prices and validate inventory** (Steps 1–39 complete) |
-| **Phases complete** | 6 of 12 |
-| **Steps complete** | 39 of 74 |
+| **Current step** | **Step 41 — Customer addresses** (Steps 1–40 complete, Phase 7 done) |
+| **Phases complete** | 7 of 12 |
+| **Steps complete** | 40 of 74 |
 
 ### Goals
 
@@ -229,13 +229,13 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 37 | Cart retrieval and item management endpoints | ✅ |
 | 38 | Quantity changes and item removal | ✅ |
 | 39 | Price and availability handling in a cart | ✅ |
-| 40 | When to calculate prices and validate inventory (never trust client prices) | 🔵 |
+| 40 | When to calculate prices and validate inventory (never trust client prices) | ✅ |
 
 ### Phase 8 — Addresses and Checkout Preparation
 
 | # | Step | Status |
 |---|---|---|
-| 41 | Customer addresses | ⬜ |
+| 41 | Customer addresses | 🔵 |
 | 42 | Associate addresses with users | ⬜ |
 | 43 | Shipping and checkout data contracts | ⬜ |
 | 44 | Order creation design with transaction boundaries | ⬜ |
@@ -3635,6 +3635,132 @@ Ruff clean. All test data removed; `carts` 0, `cart_items` 0, `products` 1, `use
 
 - `available_stock` is visible to any authenticated customer with the product in their cart;
   revisit if inventory levels become commercially sensitive.
+
+---
+
+### ✅ Step 40 — When to Calculate Prices and Validate Inventory
+
+**Completed:** 2026-10-31 · Phase 7 complete. No code change; the existing behaviour was
+attacked rather than described.
+
+#### The attack, attempted seven ways
+
+The oldest e-commerce exploit is a client sending its own price. Every attempt was refused:
+
+| Attempt | Result |
+|---|---|
+| `POST /cart/items` with `price`, `unit_price`, `line_total`, `total` | 422 each |
+| `PUT /cart/items/{id}` with `price`, `unit_price`, `total` | 422 each |
+| customer creates a product priced `0.01` | 403 |
+| customer patches a product's price | 403 |
+
+Two independent defences, and the order matters. **No request schema has a money field a
+customer can set** — `CartItemAdd` carries only `product_id` and `quantity` — so there is
+nothing to validate. `extra="forbid"`, added in Step 33 after a silent-drop bug, turns an
+attempt into a visible 422 rather than a silent ignore. Writing prices at all requires admin,
+which is the Step 30 role check.
+
+The strongest defence is the first one: the field does not exist. A validator can be wrong; an
+absent field cannot be set.
+
+#### Prices are read, never remembered
+
+Demonstrated: with a product at `100.00` in a customer's cart, an admin raised it to `250.00`,
+and the customer's next `GET /cart` showed `250.00` with the total following. Nothing was
+cached, so nothing could be stale.
+
+#### Why `Decimal`, measured
+
+```
+  A cart of 3 items at 0.10 each
+    float   0.1 * 3 = 0.30000000000000004
+    Decimal 0.10 * 3 = Decimal('0.30')
+
+  1000 orders of 19.99 each
+    float   19990.000000000135
+    Decimal 19990.00
+    off by  1.35E-10
+    float   == 19990.00 ?  False
+    Decimal == 19990.00 ?  True
+```
+
+After a thousand ordinary orders the float total is wrong and an equality check against the
+expected figure fails. `Numeric(12, 2)` in PostgreSQL and `Decimal` in Python keep it exact at
+both ends with no lossy conversion between them.
+
+The server also refuses prices it cannot represent honestly: `-1.00` → 422, and `9.999` → 422
+rather than rounding to `10.00` silently.
+
+#### The timeline: when a price is calculated
+
+| Moment | What happens | Source of truth |
+|---|---|---|
+| Browsing | read `products.price` | `products` |
+| Add to cart | **nothing stored** | — |
+| Viewing cart | read `products.price` | `products` |
+| **Order created** | **copied into `order_items.unit_price`** | the order |
+| After | never changes again | the order |
+
+The copy at order time is not duplication of the same fact. `products.price` means *what this
+costs today*; `order_items.unit_price` means *what this customer agreed to pay on that date*.
+The second must survive every later price change, or an invoice cannot be reprinted. Copying
+earlier — at add-to-cart — would be duplication of the same fact, which is why Step 36 refused
+it.
+
+#### The timeline: when inventory is validated
+
+| Moment | Check | Authority |
+|---|---|---|
+| Add to cart | yes, no lock held | **none** — a courtesy |
+| Viewing cart | reported as `issue` | **none** |
+| **Order created** | `SELECT ... FOR UPDATE`, then decrement | **authoritative** |
+
+Everything built in Phase 7 is advisory. It exists to give a good error early, not to make a
+promise.
+
+#### Carry-forward for Phase 9
+
+1. **Lock every product row in the order, sorted by `product_id`** — the deadlock rule proven
+   in Step 35. Two orders containing the same two products in different cart order deadlock
+   otherwise, and PostgreSQL kills one of them.
+2. **Re-check availability under the lock.** A cart reporting `has_issues: false` proves
+   nothing; it was computed before any lock existed.
+3. **Read prices inside the transaction** and copy them into `order_items`.
+4. **Decrement stock in the same transaction** as the order insert. Separate transactions
+   allow an order to exist for stock that was never taken.
+5. **Clear the cart only after the order commits** (roadmap Step 50). Clearing first loses the
+   customer's basket when the order fails.
+
+#### Verification
+
+14 of 14 assertions over HTTP, plus the arithmetic demonstration above. No application code
+was changed in this step. All test data removed.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** None directly. Pricing integrity is a financial-reporting
+  and consumer-protection concern rather than a data-protection one: a customer charged a
+  figure other than the one displayed is a regulatory problem in every jurisdiction in scope.
+- **Security:** The client-price injection class is closed, and closed structurally — the
+  field does not exist in any customer-facing request schema, so there is no validator to
+  bypass. Price writes require an administrator. Verified by attempting seven variants rather
+  than by reading the schemas.
+- **Data residency / cross-border:** None. Local Docker PostgreSQL on `127.0.0.1:5433`. All
+  test data synthetic.
+- **Required controls / approvals:** Price changes are **not audited** — there is no record of
+  who changed a price, when, or from what. For a regulated fintech this is a genuine gap:
+  pricing history is routinely required to answer a customer dispute or a regulator's
+  question, and `products.updated_at` records only that something changed. Step 60 must cover
+  price changes specifically, not only authentication events. Until then, a disputed charge
+  cannot be reconstructed from the data.
+- **Residual risk:** **Medium**, driven entirely by the missing price-change audit rather than
+  by anything in the request path. The injection risk itself is **Low** and structurally
+  closed.
+
+#### Open items added
+
+- No audit trail for price changes; a disputed charge cannot be reconstructed. Must be covered
+  by Step 60.
 
 ---
 
