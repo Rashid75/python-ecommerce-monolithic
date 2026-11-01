@@ -75,3 +75,12 @@ class PriceChangedError(AppError):
     Raised instead of charging a different amount. Carries both totals,
     because the only useful thing to tell someone is what changed.
     """
+
+
+class BusyError(AppError):
+    """The database was too contended to finish in time. 503.
+
+    Raised when a statement waited longer than lock_timeout for a row lock.
+    Carries no detail from the database: the client is told to try again,
+    not which rows were locked or by what.
+    """

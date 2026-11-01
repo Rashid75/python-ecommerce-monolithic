@@ -8,9 +8,12 @@ copied. Checkout is the transaction around that moment.
 from collections.abc import Sequence
 from decimal import Decimal
 
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import (
+    BusyError,
     EmptyCartError,
     NotFoundError,
     PriceChangedError,
@@ -76,6 +79,13 @@ def build_order(
     )
 
 
+# How long checkout waits for any one row lock before giving up. A plain
+# constant rather than a setting: it is a property of this transaction, not
+# something an operator should tune per environment without understanding
+# what it protects.
+LOCK_TIMEOUT = "5s"
+
+
 def _must_be_buyable(product: Product, quantity: int) -> None:
     """Refuse a product that is off sale, or more of it than exists.
 
@@ -121,6 +131,20 @@ def checkout(db: Session, user_id: int, address_id: int, expected_total: Decimal
     customer buying that product behind it (Step 44).
     """
     try:
+        # SET LOCAL applies to this transaction only, so it cannot leak to
+        # whatever else borrows this pooled connection next.
+        #
+        # Without it a statement waits for a row lock forever. Checkout
+        # holds a cart lock and several product locks at once, so one stuck
+        # transaction on a popular product would queue every other customer
+        # buying it, each holding a pooled connection until the pool is
+        # empty and endpoints with nothing to do with orders start failing.
+        # Five seconds is far longer than a healthy checkout needs -
+        # twenty of them contending over the same two products measured at
+        # tens of milliseconds each - so reaching it means something is
+        # wrong, and failing fast is better than queueing.
+        db.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
+
         cart_id = cart_repo.get_cart_id(db, user_id)
         if cart_id is None:
             raise EmptyCartError("Your cart is empty")
@@ -177,6 +201,15 @@ def checkout(db: Session, user_id: int, address_id: int, expected_total: Decimal
 
         db.commit()
         return order
+    except OperationalError as exc:
+        db.rollback()
+        # 55P03 is lock_not_available: a row lock was held by someone else
+        # for longer than lock_timeout. Translated here so the router never
+        # sees a database error, and so the client is told to try again
+        # rather than which rows were busy.
+        if getattr(exc.orig, "sqlstate", None) == "55P03":
+            raise BusyError("The shop is busy right now. Please try again.") from exc
+        raise
     except Exception:
         # Any failure releases the cart and product locks immediately
         # rather than holding them until the request ends.

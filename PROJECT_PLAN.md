@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 48 — Validate inventory, atomic stock updates** (Steps 1–47 complete) |
+| **Current step** | **Step 49 — Order statuses and valid state transitions** (Steps 1–48 complete) |
 | **Phases complete** | 8 of 12 |
-| **Steps complete** | 47 of 74 |
+| **Steps complete** | 48 of 74 |
 
 ### Goals
 
@@ -247,8 +247,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 45 | Order and order-item models | ✅ |
 | 46 | Immutable order-item snapshots (name, SKU, quantity, unit price) | ✅ |
 | 47 | Checkout and order creation | ✅ |
-| 48 | Validate inventory, atomic stock updates | 🔵 |
-| 49 | Order statuses and valid state transitions | ⬜ |
+| 48 | Validate inventory, atomic stock updates | ✅ |
+| 49 | Order statuses and valid state transitions | 🔵 |
 | 50 | Clear/update cart only after successful order creation | ⬜ |
 | 51 | Order history, order details, authorized cancellation | ⬜ |
 | 52 | Explain idempotency, transaction failures, concurrent checkouts | ⬜ |
@@ -4692,6 +4692,156 @@ rather than in a diagram.
 - The price confirmation is not recorded anywhere. The shop cannot evidence that the customer
   agreed to the amount charged. Step 60.
 - `lock_timeout` is still unset and checkout now holds several locks at once in production code.
+
+### ✅ Step 48 — Inventory Validation and Atomic Stock Updates Under Concurrency
+
+**Completed:** 2026-11-01 · No migration. Step 47 showed checkout works one request at a time;
+this step tests that claim with fifty of them at once, and closes the `lock_timeout` item that
+had been carried open since Step 44.
+
+#### 1. Fifty customers, ten items, one instant
+
+```
+  50 customers, each with 1 of product 71, which has 10 in stock
+  all 50 requests released at once, finished in 1.17s
+  outcomes: {201: 10, 409: 40}
+```
+
+| Case | Result |
+|---|---|
+| exactly the shelf was sold | 10 items on 10 orders |
+| stock reached zero, not below | 0 left |
+| orders match the stock taken | 10 sold, 10 taken |
+| one order per successful request | 10 orders, 10 × 201 |
+| the losers kept their carts | 40 carts still hold it |
+
+Nothing was oversold and nothing was lost. The contrast with Step 34 is the point: the same
+shape of test, before `SELECT ... FOR UPDATE` existed, sold 21 items from a shelf of 10 while
+the check constraint never fired.
+
+The last row matters too. A customer who loses the race keeps their cart intact, so they can
+try something else rather than finding their basket silently emptied.
+
+#### 2. Overlapping carts, opposite order
+
+First, the shape to avoid — two transactions locking the same two rows in opposite orders, with
+no sorting:
+
+```
+   forwards: committed
+   backwards: 40P01 deadlock detected
+```
+
+Then the same collision through checkout, where `lock_many` sorts by id. Twenty customers, half
+with cart lines added X then Y, half Y then X:
+
+```
+   20 checkouts over the same two products, released at once
+   finished in 0.63s -> 31ms each, serialised
+   outcomes: {201: 20}
+```
+
+| Case | Result |
+|---|---|
+| every checkout succeeded | 20/20 |
+| none hit a deadlock | only 201s |
+| stock is exactly right | 480 and 480, from 500 |
+| one order each | 20 orders |
+
+Sorting the ids is what turns a deadlock into a queue. Cart line order becomes irrelevant,
+which is why the test deliberately builds half the carts backwards.
+
+**It is a queue, though.** Twenty checkouts over the same two products ran one after another.
+Every checkout containing a popular product serialises on that product's row, which is the cost
+of being certain about stock. It is the right trade for a shop that must never oversell, but it
+sets a ceiling: a single very popular product bounds how many checkouts per second the shop can
+do, regardless of how many servers are added.
+
+#### 3. `lock_timeout`, and a control that could not be trusted
+
+Serialising is acceptable. Serialising *forever* is not: one stuck transaction on a popular
+product would queue every customer buying it, each holding a pooled connection, until the pool
+empties and endpoints with nothing to do with orders begin failing.
+
+The first attempt set it on the connection string:
+
+```python
+connect_args={"connect_timeout": 5, "options": "-c lock_timeout=5s"}
+```
+
+Directly against the engine this behaved perfectly — `SHOW lock_timeout` returned `5s` and a
+contended lock raised `55P03` after 5.01s. Through the running server it did not: one run
+returned 503 after **1.17s**, the next waited the full **8.52s** and succeeded, with no timeout
+at all. The setting could not be shown to apply where it mattered, so it was backed out rather
+than shipped.
+
+Replaced with a statement inside the transaction that needs it:
+
+```python
+db.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
+```
+
+`SET LOCAL` lasts for this transaction only, so it cannot leak to whatever borrows the pooled
+connection next. It is visible at the point it matters rather than buried in engine
+configuration, and it is reproducible: two consecutive runs gave 5.24s and 5.05s.
+
+`55P03` is translated in the service into `BusyError`, and the router returns **503**. The
+message is *The shop is busy right now. Please try again.* — nothing about locks, rows or
+timeouts reaches the client.
+
+| Case | Result |
+|---|---|
+| checkout while the row is held | 503 after 5.24s |
+| the same, second run | 503 after 5.05s |
+| no database detail leaked | *The shop is busy right now. Please try again.* |
+| nothing was written | stock 50, 0 orders |
+| once the lock is released | 201 after 0.04s |
+| and took the stock | 49 of 50 |
+
+**503, not 500.** Nothing is broken and the request was valid; the shop is busy. A 500 would
+also invite a client to stop retrying, which is the opposite of what should happen here.
+
+#### Files changed
+
+| File | Change |
+|---|---|
+| `app/modules/orders/service.py` | `LOCK_TIMEOUT`, `SET LOCAL`, `55P03` → `BusyError` |
+| `app/modules/orders/router.py` | `BusyError` → 503 |
+| `app/core/exceptions.py` | `BusyError` |
+
+#### Verification
+
+37 assertions across four suites, all passing: 5 on the fifty-buyer race, 5 on the deadlock
+comparison, 6 on the lock timeout (× 2 runs), and Step 47's full 21 re-run as a regression
+check. Ruff clean; no test data left behind.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** Overselling is a financial and customer-protection problem
+  before it is an operational one — taking money for goods that do not exist creates refund
+  obligations and a stock record that does not reconcile. The fifty-buyer test is the evidence
+  that it cannot happen, and it is evidence of behaviour rather than of schema, which is the
+  kind that survives review.
+- **Security:** `lock_timeout` is an availability control. Without it, a single stuck
+  transaction on a popular product is a denial-of-service with no attacker required, and it
+  would take down endpoints unrelated to orders by exhausting the connection pool. The 503 body
+  carries no database detail, in line with the standing rule that internal exception messages
+  never reach clients.
+- **Data residency / cross-border:** Unchanged.
+- **Required controls / approvals:** The serialisation ceiling should be stated in capacity
+  planning rather than discovered under load — one hot product bounds checkout throughput no
+  matter how many servers run. Lock-wait monitoring is still absent, so a rising number of 503s
+  would be the only signal that contention is building, and nothing currently counts them.
+  Idempotency on checkout and pending-order stock release both remain open.
+- **Residual risk:** **Low** for the inventory path, which is now demonstrated under
+  concurrency rather than asserted. The project's standing **Medium** from Step 45 — personal
+  data that deletion will not reach — is unchanged.
+
+#### Open items added
+
+- Checkout throughput is bounded by the hottest single product. State it in capacity planning.
+- Nothing counts or alerts on 503s from lock contention; a rising rate would be the first sign
+  of trouble and is currently invisible.
 
 ## 7. Standing Security & Compliance Commitments
 

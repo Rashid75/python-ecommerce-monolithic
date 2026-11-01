@@ -8,6 +8,7 @@ nothing in the request a client could change to reach someone else's.
 from fastapi import APIRouter, HTTPException, status
 
 from app.core.exceptions import (
+    BusyError,
     EmptyCartError,
     NotFoundError,
     PriceChangedError,
@@ -44,4 +45,8 @@ def checkout(data: CheckoutRequest, user: CurrentUser, db: DbSession) -> OrderRe
         # Sold out or withdrawn between adding to the cart and checking
         # out. 409 rather than 422: nothing about the request was wrong.
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except BusyError as exc:
+        # 503, not 500: nothing is broken and the request was valid. The
+        # message says to try again and nothing about what was locked.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     return OrderRead.from_order(order)
