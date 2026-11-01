@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 49 — Order statuses and valid state transitions** (Steps 1–48 complete) |
+| **Current step** | **Step 50 — Clear/update cart only after successful order creation** (Steps 1–49 complete) |
 | **Phases complete** | 8 of 12 |
-| **Steps complete** | 48 of 74 |
+| **Steps complete** | 49 of 74 |
 
 ### Goals
 
@@ -248,8 +248,8 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 46 | Immutable order-item snapshots (name, SKU, quantity, unit price) | ✅ |
 | 47 | Checkout and order creation | ✅ |
 | 48 | Validate inventory, atomic stock updates | ✅ |
-| 49 | Order statuses and valid state transitions | 🔵 |
-| 50 | Clear/update cart only after successful order creation | ⬜ |
+| 49 | Order statuses and valid state transitions | ✅ |
+| 50 | Clear/update cart only after successful order creation | 🔵 |
 | 51 | Order history, order details, authorized cancellation | ⬜ |
 | 52 | Explain idempotency, transaction failures, concurrent checkouts | ⬜ |
 
@@ -4842,6 +4842,150 @@ check. Ruff clean; no test data left behind.
 - Checkout throughput is bounded by the hottest single product. State it in capacity planning.
 - Nothing counts or alerts on 503s from lock contention; a rising rate would be the first sign
   of trouble and is currently invisible.
+
+### ✅ Step 49 — Order Statuses and Valid State Transitions
+
+**Completed:** 2026-11-01 · No migration, no endpoint. Step 45 fixed the five legal *values*;
+this step fixes the legal *moves between them*.
+
+#### The map
+
+```
+  pending    ->  paid, cancelled
+  paid       ->  shipped, cancelled
+  shipped    ->  delivered
+  delivered  ->  (terminal)
+  cancelled  ->  (terminal)
+```
+
+**It lives in the service, not beside the status values in `models.py`,** because the database
+is not what enforces it. A check constraint can say the status is one of five words; it cannot
+say a delivered order must never become pending again, because that depends on the row's
+*previous* value. The map belongs next to the code that applies it.
+
+**`delivered` and `cancelled` are terminal.** A delivered order that comes back is a return —
+a new record, not an edit to this one. A cancelled order that is reinstated is a new order.
+Both are deliberate gaps.
+
+**`shipped` cannot be cancelled.** Once a parcel is with a courier, stopping it is a return.
+Allowing the cancellation would put the order in a state that does not match where the goods
+physically are.
+
+**Standing still is refused.** Asking a paid order to become paid is not harmless: it means the
+caller believed it was in some other state, and quietly agreeing hides that.
+
+#### No trigger here, unlike Step 46
+
+`order_items` got a database trigger because a line must never change. Status is the opposite:
+it is *meant* to change, and an operator occasionally needs to correct one. A trigger would
+block the legitimate case along with the illegitimate one. The check constraint still guarantees
+the value is one of the five; the sequence is the service's job.
+
+#### Guarded at import
+
+```python
+assert set(ALLOWED_TRANSITIONS) == set(ORDER_STATUSES), (
+    "every order status needs an entry in ALLOWED_TRANSITIONS"
+)
+```
+
+Adding a status to `OrderStatus` and forgetting the map would otherwise raise `KeyError` on a
+real order, in production, the first time one reached that status. Now the application refuses
+to start.
+
+#### The lock
+
+`change_status` reads the current status, decides, and writes a new one — a read-modify-write,
+the same shape that lost 25 of 50 sales in Step 34. `repository.get_by_id_for_update` takes the
+row lock first, so a second caller waits and then sees what the first wrote.
+
+Stock is deliberately **not** returned when an order is cancelled. Whether a cancelled paid
+order releases stock immediately or only after a refund clears is a business decision with its
+own rules, and it belongs with the cancellation endpoint in Step 51.
+
+#### Files changed
+
+| File | Change |
+|---|---|
+| `app/modules/orders/service.py` | `ALLOWED_TRANSITIONS`, the import-time assert, `change_status` |
+| `app/modules/orders/repository.py` | `get_by_id_for_update` |
+| `app/core/exceptions.py` | `InvalidTransitionError` |
+
+#### Verification
+
+8 of 8. The full matrix — 25 orders, each walked to its starting status legally, then asked to
+make every possible move:
+
+```
+               pend   paid   ship   deli   canc
+     pending      .     ->      .      .     ->
+        paid      .      .     ->      .     ->
+     shipped      .      .      .     ->      .
+   delivered      .      .      .      .      .
+   cancelled      .      .      .      .      .
+```
+
+Every refused move left the status untouched, which is checked separately from the refusal
+itself. Plus: standing still refused, a nonexistent order 404s, and a direct
+`UPDATE ... SET status = 'refunded'` is still stopped by `ck_orders_status_is_known`.
+
+**Two payments at the same instant**, 20 races:
+
+```
+   20 races: {('paid', 'refused'): 20}
+```
+
+Exactly one won every time. This is the race worth running, because `paid -> paid` is illegal,
+so a lost update would show as two successes.
+
+**Paying and cancelling at the same instant**, 20 races:
+
+```
+    12 x  cancelled + no paid      -> cancelled
+     8 x  cancelled + paid         -> cancelled
+```
+
+Both outcomes are correct. In 12 races the cancellation landed first and the payment was
+refused; in 8 the payment landed first and the cancellation was then legal *from paid*. The
+first version of this test asserted "exactly one side wins" and reported a failure — the test
+was wrong, not the code. `pending -> paid -> cancelled` is a real path, and two threads
+succeeding is the lock working, not a lost update.
+
+That matters more than the passing assertion: a race test has to know which outcomes are
+legitimate, or it reports noise as a defect.
+
+#### Not yet reachable over HTTP
+
+`change_status` has no endpoint. Cancellation arrives in Step 51 and payment-driven transitions
+in Phase 10. The rules exist first so that both callers get the same ones.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** An order's status is the claim the shop makes about where
+  the customer's money and goods are. Transitions that skip states — delivered without shipped,
+  paid without a payment — produce records that cannot be reconciled against a payment provider
+  or a courier, which is a reporting problem before it is a customer-service one. The matrix is
+  the evidence those sequences cannot occur.
+- **Security:** No new surface; nothing is exposed over HTTP yet. The authorisation question is
+  carried forward and is the substantial one: a customer may cancel their own pending order, but
+  `paid -> shipped` and `shipped -> delivered` are operator actions, and `change_status` as
+  written has no notion of who is asking. Step 51 must supply it rather than assume it.
+- **Data residency / cross-border:** Unchanged.
+- **Required controls / approvals:** Status changes are not recorded anywhere beyond
+  `updated_at`, so there is no answer to *who moved this order to paid, and when*. For a
+  financial record that is a real gap, and Step 60's audit log is now carrying three specific
+  requirements rather than a general intention. Stock release on cancellation is unimplemented
+  and must be decided in Step 51. Timestamps per transition (`paid_at`, `shipped_at`) were not
+  added — `updated_at` only remembers the most recent change.
+- **Residual risk:** **Low** for the state machine itself, which is demonstrated exhaustively
+  and under concurrency. The authorisation gap is a Step 51 obligation, not a defect here.
+
+#### Open items added
+
+- `change_status` does not know who is asking. Customer-initiated and operator-initiated
+  transitions are not distinguished; Step 51 must do so.
+- No per-transition timestamps. `updated_at` remembers only the most recent change, so when an
+  order was paid cannot be answered after it ships.
 
 ## 7. Standing Security & Compliance Commitments
 

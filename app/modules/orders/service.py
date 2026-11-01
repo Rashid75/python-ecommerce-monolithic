@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import (
     BusyError,
     EmptyCartError,
+    InvalidTransitionError,
     NotFoundError,
     PriceChangedError,
     UnavailableError,
@@ -23,7 +24,7 @@ from app.modules.addresses import service as address_service
 from app.modules.addresses.schemas import ShippingAddress
 from app.modules.cart import repository as cart_repo
 from app.modules.orders import repository as repo
-from app.modules.orders.models import Order, OrderItem
+from app.modules.orders.models import ORDER_STATUSES, Order, OrderItem, OrderStatus
 from app.modules.products import repository as product_repo
 from app.modules.products.models import Product
 
@@ -77,6 +78,40 @@ def build_order(
         shipping_country=shipping.country,
         items=items,
     )
+
+
+# Which status an order may move to, from the one it has. Everything not
+# listed is refused.
+#
+# This lives in the service, not in models.py beside the status values,
+# because the database is not what enforces it. A check constraint can say
+# the status is one of five words; it cannot say that a delivered order
+# must not become pending again, because that depends on the row's previous
+# value. Putting the map here keeps the rule next to the code that applies
+# it.
+#
+# delivered and cancelled are terminal. A delivered order that comes back
+# is a return, which is a new record rather than an edit to this one, and a
+# cancelled order that is reinstated is a new order. Both are deliberate
+# gaps rather than oversights.
+#
+# shipped cannot be cancelled: once a parcel is with a courier, stopping it
+# is a return, not a cancellation, and pretending otherwise would put the
+# order in a state that does not match where the goods actually are.
+ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
+    "pending": frozenset({"paid", "cancelled"}),
+    "paid": frozenset({"shipped", "cancelled"}),
+    "shipped": frozenset({"delivered"}),
+    "delivered": frozenset(),
+    "cancelled": frozenset(),
+}
+
+# Adding a status to OrderStatus and forgetting it here would raise KeyError
+# on a real order, in production, the first time one reached that status.
+# Checked at import instead, so the application refuses to start.
+assert set(ALLOWED_TRANSITIONS) == set(ORDER_STATUSES), (
+    "every order status needs an entry in ALLOWED_TRANSITIONS"
+)
 
 
 # How long checkout waits for any one row lock before giving up. A plain
@@ -213,5 +248,42 @@ def checkout(db: Session, user_id: int, address_id: int, expected_total: Decimal
     except Exception:
         # Any failure releases the cart and product locks immediately
         # rather than holding them until the request ends.
+        db.rollback()
+        raise
+
+
+def change_status(db: Session, order_id: int, new_status: OrderStatus) -> Order:
+    """Move an order to a new status, or refuse and change nothing.
+
+    The order is locked before its current status is read. A status change
+    is a read-modify-write - look at where it is, decide, write where it
+    goes - which races exactly as stock did in Step 34. Without the lock, a
+    payment and a cancellation arriving together could both read 'pending',
+    both find their move legal, and the second would silently overwrite the
+    first.
+
+    Staying put is refused along with everything else. Asking a paid order
+    to become paid is not harmless: it means the caller believed it was in
+    some other state, and quietly agreeing hides that.
+
+    Taking stock back when an order is cancelled is NOT done here. It is a
+    business decision with its own rules - whether a cancelled paid order
+    returns stock immediately or after a refund clears - and it belongs
+    with the cancellation endpoint in Step 51.
+    """
+    try:
+        order = repo.get_by_id_for_update(db, order_id)
+        if order is None:
+            raise NotFoundError(f"Order {order_id} does not exist")
+
+        if new_status not in ALLOWED_TRANSITIONS[order.status]:
+            raise InvalidTransitionError(
+                f"An order that is {order.status} cannot become {new_status}"
+            )
+
+        order.status = new_status
+        db.commit()
+        return order
+    except Exception:
         db.rollback()
         raise

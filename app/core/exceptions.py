@@ -84,3 +84,12 @@ class BusyError(AppError):
     Carries no detail from the database: the client is told to try again,
     not which rows were locked or by what.
     """
+
+
+class InvalidTransitionError(AppError):
+    """An order cannot move from the status it has to the one asked for. 409.
+
+    The request is well formed and the order exists; it is in the wrong
+    state for what was asked. The message names both statuses, because
+    which one it is in is the thing the caller got wrong.
+    """
