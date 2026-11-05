@@ -4,6 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import AlreadyExistsError, AuthenticationError, NotFoundError
+from app.core.logging import audit
 from app.core.security import hash_password, verify_password
 from app.modules.users import repository as repo
 from app.modules.users.models import ROLE_CUSTOMER, User
@@ -48,6 +49,17 @@ def register_user(db: Session, data: UserCreate) -> User:
     return user
 
 
+def _domain(email: str) -> str:
+    """The domain half of an email, for logging.
+
+    The full address is personal data and does not belong in a log line. A
+    run of failures against one domain is still visible, which is what the
+    operational question actually needs.
+    """
+    _, _, domain = email.partition("@")
+    return domain or "unknown"
+
+
 def authenticate_user(db: Session, email: str, password: str) -> User:
     """Return the user if the credentials are right, otherwise raise.
 
@@ -60,14 +72,21 @@ def authenticate_user(db: Session, email: str, password: str) -> User:
     if user is None:
         # Spend the same time as a real check before failing.
         verify_password(password, _DUMMY_HASH)
+        # The reason is recorded in the log and never in the response.
+        # Operators need to tell a typo apart from a disabled account and
+        # from an attack; the person at the keyboard must not.
+        audit("auth.failed", email_domain=_domain(email), reason="no such user")
         raise AuthenticationError(_SIGN_IN_FAILED)
 
     if not verify_password(password, user.password_hash):
+        audit("auth.failed", user_id=user.id, reason="wrong password")
         raise AuthenticationError(_SIGN_IN_FAILED)
 
     if not user.is_active:
         # Also generic: a disabled account should not be distinguishable
         # from a wrong password by someone probing from outside.
+        audit("auth.failed", user_id=user.id, reason="account disabled")
         raise AuthenticationError(_SIGN_IN_FAILED)
 
+    audit("auth.succeeded", user_id=user.id)
     return user

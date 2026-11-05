@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Protocol
 
 from app.core.config import get_settings
-from app.core.exceptions import ValidationError
+from app.core.exceptions import SignatureError, ValidationError
 
 
 @dataclass(frozen=True)
@@ -114,14 +114,14 @@ class SandboxProvider:
         # signature was right, and a patient attacker can guess one byte at
         # a time. This takes the same time whatever the input.
         if not hmac.compare_digest(expected, signature or ""):
-            raise ValidationError("The signature does not match the body")
+            raise SignatureError("The signature does not match the body")
 
         # Parsed only after the signature passes. Handing unverified bytes
         # to a parser is work done on behalf of whoever sent them.
         try:
             body = json.loads(raw_body)
         except json.JSONDecodeError as exc:
-            raise ValidationError("The body is not valid JSON") from exc
+            raise SignatureError("The body is not valid JSON") from exc
 
         try:
             return WebhookEventData(
@@ -130,7 +130,7 @@ class SandboxProvider:
                 reference=str(body["reference"]),
             )
         except (KeyError, TypeError) as exc:
-            raise ValidationError("The event is missing id, type or reference") from exc
+            raise SignatureError("The event is missing id, type or reference") from exc
 
 
 def get_provider() -> PaymentProvider:

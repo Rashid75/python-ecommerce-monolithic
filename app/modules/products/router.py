@@ -8,10 +8,9 @@ and no database queries live here.
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query, status
 
 from app.common.schemas import Page
-from app.core.exceptions import AlreadyExistsError, InsufficientStockError, NotFoundError
 from app.db.session import DbSession
 from app.modules.products import service
 from app.modules.products.schemas import (
@@ -75,12 +74,7 @@ def list_products(
 
 @router.get("/{product_id}", summary="Get one product")
 def get_product(product_id: int, db: DbSession) -> ProductRead:
-    try:
-        return service.get_product(db, product_id)
-    except NotFoundError as exc:
-        # The service says what went wrong; the router decides that it is a
-        # 404. Step 59 moves this mapping into one place for every endpoint.
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    return service.get_product(db, product_id)
 
 
 # 201 Created is the correct status for a POST that makes a new thing.
@@ -92,25 +86,14 @@ def get_product(product_id: int, db: DbSession) -> ProductRead:
     dependencies=requires_admin,
 )
 def create_product(data: ProductCreate, db: DbSession) -> ProductRead:
-    try:
-        return service.create_product(db, data)
-    except NotFoundError as exc:
-        # An unknown category_id. 404 names the thing that was not found.
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except AlreadyExistsError as exc:
-        # 409 Conflict, not 400: the request is well formed, it just clashes
-        # with something that already exists.
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return service.create_product(db, data)
 
 
 # PATCH, not PUT: the client sends only the fields it wants to change.
 # PUT would mean "replace the whole product with this".
 @router.patch("/{product_id}", summary="Update a product", dependencies=requires_admin)
 def update_product(product_id: int, data: ProductUpdate, db: DbSession) -> ProductRead:
-    try:
-        return service.update_product(db, product_id, data)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    return service.update_product(db, product_id, data)
 
 
 # POST to a sub-resource, not PATCH on the product itself. The client is
@@ -123,14 +106,7 @@ def update_product(product_id: int, data: ProductUpdate, db: DbSession) -> Produ
     dependencies=requires_admin,
 )
 def adjust_stock(product_id: int, data: StockAdjustment, db: DbSession) -> ProductRead:
-    try:
-        return service.adjust_stock(db, product_id, data.quantity_change)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except InsufficientStockError as exc:
-        # 409, not 400 or 422: the request is well formed and the product
-        # exists. It conflicts with how much is actually on the shelf.
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return service.adjust_stock(db, product_id, data.quantity_change)
 
 
 # 204 No Content: it worked and there is nothing to send back.
@@ -141,7 +117,4 @@ def adjust_stock(product_id: int, data: StockAdjustment, db: DbSession) -> Produ
     dependencies=requires_admin,
 )
 def delete_product(product_id: int, db: DbSession) -> None:
-    try:
-        service.delete_product(db, product_id)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    service.delete_product(db, product_id)

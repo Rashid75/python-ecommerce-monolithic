@@ -20,6 +20,7 @@ from app.core.exceptions import (
     PriceChangedError,
     UnavailableError,
 )
+from app.core.logging import audit
 from app.modules.addresses import service as address_service
 from app.modules.addresses.schemas import ShippingAddress
 from app.modules.cart import repository as cart_repo
@@ -255,6 +256,15 @@ def checkout(
         # per-line price, so the message cannot honestly say which product
         # moved.
         if order.total_amount != expected_total:
+            # Recorded because the refusal is the control: if a customer
+            # later disputes what they were charged, this line is the
+            # evidence that the new total was shown and not charged.
+            audit(
+                "order.price_change_refused",
+                user_id=user_id,
+                shown_total=str(expected_total),
+                current_total=str(order.total_amount),
+            )
             raise PriceChangedError(
                 f"The total is now {order.total_amount}, not {expected_total}. "
                 f"Check your cart and try again."
@@ -289,6 +299,18 @@ def checkout(
                 return first, False
 
         db.commit()
+        audit(
+            "order.created",
+            user_id=user_id,
+            order_id=order.id,
+            total=str(order.total_amount),
+            lines=len(ordered),
+            # The amount the customer confirmed, beside the amount charged.
+            # Equal by construction; recorded so that is checkable rather
+            # than trusted.
+            confirmed_total=str(expected_total),
+            idempotent=idempotency_key is not None,
+        )
         return order, True
     except OperationalError as exc:
         db.rollback()
@@ -335,8 +357,10 @@ def change_status(db: Session, order_id: int, new_status: OrderStatus) -> Order:
                 f"An order that is {order.status} cannot become {new_status}"
             )
 
+        previous = order.status
         order.status = new_status
         db.commit()
+        audit("order.status_changed", order_id=order.id, was=previous, now=new_status)
         return order
     except Exception:
         db.rollback()
@@ -419,6 +443,7 @@ def cancel_order(db: Session, user_id: int, order_id: int) -> Order:
 
         order.status = "cancelled"
         db.commit()
+        audit("order.cancelled", user_id=user_id, order_id=order.id, by="customer")
         return order
     except OperationalError as exc:
         db.rollback()

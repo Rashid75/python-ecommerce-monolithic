@@ -7,16 +7,8 @@ the query rather than in an `if` after the row is already in hand.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException, Response, status
+from fastapi import APIRouter, Header, Response, status
 
-from app.core.exceptions import (
-    BusyError,
-    EmptyCartError,
-    InvalidTransitionError,
-    NotFoundError,
-    PriceChangedError,
-    UnavailableError,
-)
 from app.db.session import DbSession
 from app.modules.orders import service
 from app.modules.orders.schemas import CheckoutRequest, OrderRead
@@ -47,32 +39,9 @@ def checkout(
     response: Response,
     idempotency_key: IdempotencyKey = None,
 ) -> OrderRead:
-    try:
-        order, created = service.checkout(
-            db, user.id, data.address_id, data.expected_total, idempotency_key
-        )
-    except EmptyCartError as exc:
-        # 409: the cart exists and the request is well formed. It conflicts
-        # with the state of the cart.
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except NotFoundError as exc:
-        # The address is not this customer's, or does not exist. The same
-        # 404 for both, so the response cannot be used to discover which
-        # address ids are real.
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except PriceChangedError as exc:
-        # 409 as well, and deliberately not a silent re-price. The customer
-        # is shown the new total and decides again.
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except UnavailableError as exc:
-        # Sold out or withdrawn between adding to the cart and checking
-        # out. 409 rather than 422: nothing about the request was wrong.
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except BusyError as exc:
-        # 503, not 500: nothing is broken and the request was valid. The
-        # message says to try again and nothing about what was locked.
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
-
+    order, created = service.checkout(
+        db, user.id, data.address_id, data.expected_total, idempotency_key
+    )
     if not created:
         # Still 201, because that is the response the first attempt got and
         # a replay returns the original answer. The header says it was a
@@ -88,10 +57,7 @@ def list_orders(user: CurrentUser, db: DbSession) -> list[OrderRead]:
 
 @router.get("/{order_id}", summary="Get one of my orders")
 def get_order(order_id: int, user: CurrentUser, db: DbSession) -> OrderRead:
-    try:
-        order = service.get_order(db, user.id, order_id)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    order = service.get_order(db, user.id, order_id)
     return OrderRead.from_order(order)
 
 
@@ -100,14 +66,5 @@ def get_order(order_id: int, user: CurrentUser, db: DbSession) -> OrderRead:
 # which is the whole point of an order being a record.
 @router.post("/{order_id}/cancellation", summary="Cancel one of my orders")
 def cancel_order(order_id: int, user: CurrentUser, db: DbSession) -> OrderRead:
-    try:
-        order = service.cancel_order(db, user.id, order_id)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except InvalidTransitionError as exc:
-        # 409: the order exists and is the caller's, but is past the point
-        # where cancelling is something they can do alone.
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except BusyError as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    order = service.cancel_order(db, user.id, order_id)
     return OrderRead.from_order(order)

@@ -8,16 +8,9 @@ only because of a signature over the exact bytes it sent.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Header, Request, status
 from fastapi.concurrency import run_in_threadpool
 
-from app.core.exceptions import (
-    AlreadyExistsError,
-    BusyError,
-    InvalidTransitionError,
-    NotFoundError,
-    ValidationError,
-)
 from app.db.session import DbSession
 from app.modules.payments import service
 from app.modules.payments.schemas import PaymentRead, PaymentStarted
@@ -32,16 +25,7 @@ router = APIRouter(tags=["payments"])
     summary="Start paying for one of my orders",
 )
 def start_payment(order_id: int, user: CurrentUser, db: DbSession) -> PaymentStarted:
-    try:
-        payment, intent = service.start_payment(db, user.id, order_id)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except InvalidTransitionError as exc:
-        # 409: the order exists and is the caller's, but is not in a state
-        # where paying for it makes sense.
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except AlreadyExistsError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    payment, intent = service.start_payment(db, user.id, order_id)
     return PaymentStarted(
         id=payment.id,
         order_id=payment.order_id,
@@ -55,10 +39,7 @@ def start_payment(order_id: int, user: CurrentUser, db: DbSession) -> PaymentSta
 
 @router.get("/orders/{order_id}/payments", summary="Payment attempts on one of my orders")
 def list_payments(order_id: int, user: CurrentUser, db: DbSession) -> list[PaymentRead]:
-    try:
-        payments = service.list_payments(db, user.id, order_id)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    payments = service.list_payments(db, user.id, order_id)
     return [PaymentRead.model_validate(payment) for payment in payments]
 
 
@@ -67,10 +48,7 @@ def list_payments(order_id: int, user: CurrentUser, db: DbSession) -> list[Payme
 # could be forgotten on the next endpoint.
 @router.post("/orders/{order_id}/refunds", summary="Ask the provider to refund an order")
 def start_refund(order_id: int, admin: AdminUser, db: DbSession) -> PaymentRead:
-    try:
-        payment = service.start_refund(db, order_id)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    payment = service.start_refund(db, order_id)
     # Still 'succeeded'. The refund has been asked for, not confirmed, and
     # the status will only change when the provider says it has happened.
     return PaymentRead.model_validate(payment)
@@ -95,21 +73,9 @@ async def receive_webhook(
     provider_name: str, request: Request, db: DbSession, x_signature: Signature = None
 ) -> dict[str, str]:
     payload = await request.body()
-    try:
-        outcome = await run_in_threadpool(
-            service.handle_webhook, db, provider_name, payload, x_signature or ""
-        )
-    except ValidationError as exc:
-        # 400 and nothing else. An unsigned or wrongly signed request gets
-        # no information about why: the message is the provider's problem
-        # to debug with the secret in hand, and anyone else is guessing.
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except BusyError as exc:
-        # 503 tells the provider to deliver it again, which is exactly
-        # right: the event has not been applied and must not be lost.
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    outcome = await run_in_threadpool(
+        service.handle_webhook, db, provider_name, payload, x_signature or ""
+    )
     # 200 for applied, duplicate and ignored alike. Anything else makes the
     # provider retry an event that has already been dealt with.
     return {"status": outcome}

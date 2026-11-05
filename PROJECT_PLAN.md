@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 59 — Centralized exception handling** (Steps 1–58 complete, Phase 10 done) |
-| **Phases complete** | 10 of 12 |
-| **Steps complete** | 58 of 74 |
+| **Current step** | **Step 66 — Production Dockerfile** (Steps 1–65 complete, Phase 11 done) |
+| **Phases complete** | 11 of 12 |
+| **Steps complete** | 65 of 74 |
 
 ### Goals
 
@@ -268,19 +268,19 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 
 | # | Step | Status |
 |---|---|---|
-| 59 | Centralized exception handling, consistent error responses | 🔵 |
-| 60 | Structured logging and request correlation IDs | ⬜ |
-| 61 | Configuration validation and secret handling review | ⬜ |
-| 62 | CORS and security headers | ⬜ |
-| 63 | Rate limiting where justified | ⬜ |
-| 64 | Review indexes, query performance, transactions, connection pool | ⬜ |
-| 65 | Review authorization, input validation, data exposure, API risks | ⬜ |
+| 59 | Centralized exception handling, consistent error responses | ✅ |
+| 60 | Structured logging and request correlation IDs | ✅ |
+| 61 | Configuration validation and secret handling review | ✅ |
+| 62 | CORS and security headers | ✅ |
+| 63 | Rate limiting where justified | ✅ |
+| 64 | Review indexes, query performance, transactions, connection pool | ✅ |
+| 65 | Review authorization, input validation, data exposure, API risks | ✅ |
 
 ### Phase 12 — Containerization and Deployment
 
 | # | Step | Status |
 |---|---|---|
-| 66 | Production-oriented Dockerfile | ⬜ |
+| 66 | Production-oriented Dockerfile | 🔵 |
 | 67 | Finalize Docker Compose for local development | ⬜ |
 | 68 | Environment variables and persistent PostgreSQL storage | ⬜ |
 | 69 | Explain image builds, containers, volumes, networks, startup deps | ⬜ |
@@ -5341,6 +5341,205 @@ difference between a webhook endpoint and a public "mark this order paid" button
   ideally an IP allow-list.
 - Nothing alerts on payments stuck in `pending`, which also holds stock indefinitely.
 - Webhook events and idempotency keys are both stored without a retention window.
+
+### ✅ Steps 59–65 — Application Hardening
+
+**Completed:** 2026-11-05 · One migration, applied. Phase 11 complete.
+
+---
+
+#### Step 59 — Centralized exception handling
+
+Every router caught every exception it could raise and chose a status code. The same mapping was
+written out eleven times, which is eleven chances for one endpoint to answer 403 where the
+others answer 404 — and that difference is exactly what an attacker reads.
+
+Now: a service raises and says nothing about HTTP, a router catches nothing, and
+`app/core/errors.py` holds the only place a status code is decided.
+
+**172 lines of duplicated translation removed** across nine routers.
+
+| | |
+|---|---|
+| `NotFoundError` | 404 |
+| `AuthenticationError` | 401 |
+| `SignatureError` | 400 |
+| `ValidationError` | 422 |
+| `AlreadyExists`, `InUse`, `InsufficientStock`, `Unavailable`, `EmptyCart`, `PriceChanged`, `InvalidTransition` | 409 |
+| `BusyError` | 503 |
+
+Consolidating exposed a real inconsistency. `ValidationError` meant 422 everywhere except the
+webhook, where a bad signature returned 400. Rather than special-casing, `SignatureError` was
+added: a bad signature is not a business-rule failure, the request is not trusted at all.
+
+Every response now carries a stable `code` beside `detail`, so a client can branch on something
+that does not change when wording does.
+
+The catch-all `Exception` handler logs the traceback and answers *"Something went wrong. Please
+try again."* Exception text routinely contains table names, SQL and values from the row that
+failed, and none of it belongs in a response.
+
+**A regression this caught:** stripping the try/except from login dropped the
+`WWW-Authenticate: Bearer` header. Restored in the handler, where it now covers every 401 rather
+than only that one endpoint.
+
+#### Step 60 — Structured logging, correlation, and the audit trail
+
+JSON lines, not sentences. A sentence is easy to read once and impossible to search.
+
+Every request gets an id — an incoming `X-Request-ID` is honoured so a trace started upstream
+continues, but it is stripped to alphanumerics and capped at 64 characters, because it is
+attacker-controlled text heading into log files that something else will parse.
+
+The audit events are the part that closes items carried since Step 46:
+
+| Event | Answers |
+|---|---|
+| `order.created` | with `confirmed_total` beside `total` — what the customer agreed to, next to what was charged |
+| `order.price_change_refused` | the evidence that a new total was shown and *not* charged |
+| `order.status_changed`, `order.cancelled` | who moved an order and when |
+| `payment.started`, `payment.status_changed` | with the provider event id that caused it |
+| `refund.requested` | separate from the confirmation, because they are separate facts |
+| `webhook.duplicate`, `webhook.ignored` | with the reason, so a silent no-op is still explainable |
+| `auth.failed` | with the *reason*, which the response deliberately never gives |
+
+`auth.failed` logs the email **domain**, never the address. A run of failures against one domain
+is still visible, which is what the operational question needs; the full address is personal
+data and does not belong in a log line.
+
+These go to a separate `app.audit` logger so they can be shipped to storage with a different
+retention — and, the part that matters, storage the application cannot edit or delete.
+
+#### Step 61 — Configuration and secret handling
+
+`Settings` now refuses to start on a placeholder or a weak secret:
+
+```python
+if not value or "CHANGE_ME" in value:
+    raise ValueError(f"{name} is still the example value")
+if self.is_production and len(value) < 32:
+    raise ValueError(f"{name} must be at least 32 characters in production")
+```
+
+The failure mode being guarded against is somebody copying `.env.example`, getting a working
+application, and never going back. The length floor is production-only: local development may
+have a short secret, a deployment may not.
+
+Also added: production refuses `cors_origins` containing `*`, and refuses the sandbox payment
+provider.
+
+#### Step 62 — CORS and security headers
+
+`cors_origins` defaults to **empty**. A misconfigured CORS policy is how an API gets read by
+someone else's site, and "allow nothing" is the only safe default to ship.
+
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`
+always. HSTS and a strict CSP in production only — HSTS over plain HTTP is meaningless and, once
+a browser has seen it, breaks `http://localhost` for the max-age.
+
+#### Step 63 — Rate limiting
+
+A fixed-window counter in process memory, on POST only.
+
+| Path | Limit | Why |
+|---|---|---|
+| `/auth/login` | 10/min | password guessing; Argon2 makes each attempt costly for us too |
+| `/users` | 5/min | stop a script filling the users table |
+| `/webhooks` | 120/min | unauthenticated by design; bounds what an unsigned flood costs |
+| `/orders` | 60/min | checkout holds locks and writes several tables |
+
+**Stated plainly, because it matters:** this counts per process. Two workers mean twice the
+effective limit and a restart forgets everything. It is a guard against brute force and
+accidental floods, not a quota system and not a defence against a distributed attacker. A shared
+counter would need Redis, which the project rules exclude; saying so is better than implying a
+protection that is not there.
+
+Reads are not limited — rate-limiting a customer browsing their orders would make them hit a
+wall for no security gain.
+
+`_client_key` uses the peer address and **deliberately ignores `X-Forwarded-For`**. Until the
+application knows which proxies to trust, honouring that header would let any caller claim any
+address and bypass this entirely. Revisited in Step 73.
+
+#### Step 64 — Indexes, queries, transactions, pool
+
+Asked PostgreSQL rather than guessing — every foreign key whose first column has no index:
+
+```
+   idempotency_keys.order_id
+```
+
+One finding, and a real one: that key is `ON DELETE RESTRICT`, so PostgreSQL checks it by
+looking for referencing rows, and with no index that is a full scan of the table on every order
+deletion. Indexed, migration applied.
+
+Pool settings are now spelled out rather than inherited: `pool_size=5`, `max_overflow=10`,
+`pool_timeout=10`, `pool_recycle=1800`. The sizes are SQLAlchemy's defaults, kept but made
+visible, with the note that raising them without raising PostgreSQL's `max_connections` trades
+one queue for another. `pool_timeout` is lowered from 30s, because waiting half a minute for a
+connection turns a busy moment into a pile of requests all holding sockets open.
+
+#### Step 65 — Authorization, input, data exposure
+
+Run as checks against a live server rather than written as prose.
+
+#### Verification
+
+**24 of 24** for Phase 11, plus the earlier suites re-run as regression after the router
+refactor: **40/40** payments, **23/23** orders and idempotency, **8/8** state machine.
+
+| Case | Result |
+|---|---|
+| a 404 | carries `code: not_found` |
+| an empty cart | 409 `empty_cart` |
+| a malformed body | 422 `request_invalid` |
+| a bad sign-in | 401 `authentication_failed`, **`WWW-Authenticate: Bearer`** |
+| — the message | *Incorrect email or password*, nothing specific |
+| a bad webhook signature | 400 `bad_signature` |
+| a request id | returned on every response |
+| a caller's own id | honoured |
+| an oversized, odd id | cleaned and capped to 64 characters |
+| `nosniff` / `DENY` / `no-referrer` | all present |
+| HSTS outside production | absent |
+| 14 sign-in attempts | blocked at attempt 10 of a limit of 10 |
+| — the 429 | `Retry-After: 60`, `code: rate_limited` |
+| reads | not limited |
+| no token / forged token | 401 |
+| a customer creating products | 403 |
+| my own profile | no `password_hash` |
+| an unexpected body field | 422 |
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** The audit trail is the material change. Order creation now
+  records the total the customer confirmed beside the total charged, price-change refusals are
+  recorded as evidence the control fired, and payment status changes carry the provider event id
+  that caused them. Log content was designed against PDPL data-minimisation: ids, statuses and
+  amounts only, with `auth.failed` carrying an email domain rather than an address, and no
+  address field logged anywhere. **Still required:** audit log retention, and storage the
+  application cannot modify — a log the application can rewrite is not evidence.
+- **Security:** Error responses are now uniform by construction rather than by eleven routers
+  agreeing, which removes a class of information leak. Tracebacks never reach a client. Secrets
+  cannot be left at example values. CORS is closed by default. Rate limiting covers the brute
+  force surface with its per-process limitation stated rather than implied.
+- **Data residency / cross-border:** Logs are a data flow. Shipping them to a log platform
+  outside KSA, UAE and Bahrain is a cross-border transfer of the ids and amounts above, and must
+  be assessed with the platform choice rather than after it.
+- **Required controls / approvals:** Audit log retention and immutability. A log platform whose
+  residency is assessed. `X-Forwarded-For` trust must be configured with Nginx in Step 73 or the
+  rate limit counts one proxy address for everyone. Nothing yet alerts on `auth.failed` or
+  `ratelimit.blocked` rates, which are now loggable but not watched.
+- **Residual risk:** **Low** for the application surface. The project's standing **Medium** from
+  Step 45 — personal data in orders that customer deletion will not reach — is unchanged and
+  remains the oldest open item.
+
+#### Open items added
+
+- Audit logs need a retention period and append-only storage; the application must not be able
+  to rewrite its own evidence.
+- Log destination needs a residency assessment.
+- Rate limiting is per process and resets on restart; `X-Forwarded-For` trust unconfigured.
+- Nothing alerts on failed-sign-in or rate-limit rates.
 
 ## 7. Standing Security & Compliance Commitments
 

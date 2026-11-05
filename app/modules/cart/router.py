@@ -7,9 +7,8 @@ change to someone else's.
 
 from decimal import Decimal
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, status
 
-from app.core.exceptions import NotFoundError, UnavailableError, ValidationError
 from app.db.session import DbSession
 from app.modules.cart import service
 from app.modules.cart.models import Cart
@@ -64,16 +63,7 @@ def get_cart(user: CurrentUser, db: DbSession) -> CartRead:
 # existing line rather than create one, and there is no new URL to point at.
 @router.post("/items", summary="Add a product to my cart")
 def add_item(data: CartItemAdd, user: CurrentUser, db: DbSession) -> CartRead:
-    try:
-        cart = service.add_item(db, user.id, data.product_id, data.quantity)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except UnavailableError as exc:
-        # 409, not 422: the request is well formed and the product exists.
-        # It conflicts with the product's current state.
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except ValidationError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    cart = service.add_item(db, user.id, data.product_id, data.quantity)
     return _to_read(cart)
 
 
@@ -84,12 +74,7 @@ def add_item(data: CartItemAdd, user: CurrentUser, db: DbSession) -> CartRead:
 def set_item_quantity(
     product_id: int, data: CartItemSetQuantity, user: CurrentUser, db: DbSession
 ) -> CartRead:
-    try:
-        cart = service.set_item_quantity(db, user.id, product_id, data.quantity)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except UnavailableError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    cart = service.set_item_quantity(db, user.id, product_id, data.quantity)
     return _to_read(cart)
 
 
@@ -97,10 +82,7 @@ def set_item_quantity(
 # the client needs the new one; a bare 204 would force an immediate GET.
 @router.delete("/items/{product_id}", summary="Remove an item from my cart")
 def remove_item(product_id: int, user: CurrentUser, db: DbSession) -> CartRead:
-    try:
-        cart = service.remove_item(db, user.id, product_id)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    cart = service.remove_item(db, user.id, product_id)
     return _to_read(cart)
 
 

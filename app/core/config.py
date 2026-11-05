@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     # Print every SQL statement. Handy while learning.
     db_echo: bool = False
 
+    # --- Logging ---
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+
     # --- Authentication ---
     # No default, for the same reason as the database password: a default
     # secret is one an attacker already knows, and defaults get deployed.
@@ -47,6 +50,13 @@ class Settings(BaseSettings):
     # Short-lived on purpose. A stolen token stays usable until it expires,
     # and nothing here can revoke one early.
     jwt_expire_minutes: int = Field(default=30, ge=1, le=1440)
+
+    # --- Web ---
+    # Browsers that may call this API from a page. Empty by default: a
+    # misconfigured CORS policy is how a cookie-authenticated API gets read
+    # by someone else's site, and "allow nothing" is the only safe default
+    # to ship. Set it explicitly per environment.
+    cors_origins: tuple[str, ...] = ()
 
     # --- Payments ---
     # Only one option today. A Literal rather than a plain string so a typo
@@ -77,6 +87,32 @@ class Settings(BaseSettings):
         )
 
     @model_validator(mode="after")
+    def check_secrets_are_real(self) -> "Settings":
+        """Refuse to start on a placeholder or an obviously weak secret.
+
+        The .env.example in this repository ships CHANGE_ME values on
+        purpose, and the failure mode this guards against is somebody
+        copying it, getting a working application, and never going back.
+
+        The length floor applies in production only. Local development is
+        allowed a short secret; a deployment is not, because 32 bytes is
+        the point below which guessing a HS256 signing key stops being
+        theoretical.
+        """
+        secrets = {
+            "APP_DB_PASSWORD": self.db_password,
+            "APP_JWT_SECRET": self.jwt_secret,
+            "APP_PAYMENT_WEBHOOK_SECRET": self.payment_webhook_secret,
+        }
+        for name, secret in secrets.items():
+            value = secret.get_secret_value()
+            if not value or "CHANGE_ME" in value:
+                raise ValueError(f"{name} is still the example value")
+            if self.is_production and len(value) < 32:
+                raise ValueError(f"{name} must be at least 32 characters in production")
+        return self
+
+    @model_validator(mode="after")
     def check_production_is_safe(self) -> "Settings":
         # Both of these print internal details that clients must never see.
         if self.is_production and (self.debug or self.db_echo):
@@ -87,6 +123,10 @@ class Settings(BaseSettings):
         # first checkout.
         if self.is_production and self.payment_provider == "sandbox":
             raise ValueError("APP_PAYMENT_PROVIDER must not be 'sandbox' in production")
+        # "*" would let any site on the internet make authenticated calls
+        # from a victim's browser. There is no production case for it.
+        if self.is_production and "*" in self.cors_origins:
+            raise ValueError("APP_CORS_ORIGINS must not include '*' in production")
         return self
 
 

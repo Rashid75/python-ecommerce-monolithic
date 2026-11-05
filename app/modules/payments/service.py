@@ -16,6 +16,7 @@ from app.core.exceptions import (
     InvalidTransitionError,
     NotFoundError,
 )
+from app.core.logging import audit
 from app.modules.orders import service as order_service
 from app.modules.payments import repository as repo
 from app.modules.payments.models import Payment, PaymentStatus, WebhookEvent
@@ -92,6 +93,15 @@ def start_payment(db: Session, user_id: int, order_id: int) -> tuple[Payment, Pa
         )
         repo.add(db, payment)
         db.commit()
+        audit(
+            "payment.started",
+            user_id=user_id,
+            order_id=order.id,
+            payment_id=payment.id,
+            amount=str(payment.amount),
+            currency=payment.currency,
+            provider=provider.name,
+        )
         return payment, intent
     except Exception:
         db.rollback()
@@ -120,6 +130,15 @@ def start_refund(db: Session, order_id: int) -> Payment:
         raise NotFoundError(f"Order {order_id} has no successful payment to refund")
 
     get_provider().start_refund(payment.reference, payment.amount)
+    # The request, not the result. The result arrives as a webhook and is
+    # recorded there; an auditor needs both, and needs to see that they are
+    # separate facts.
+    audit(
+        "refund.requested",
+        order_id=order_id,
+        payment_id=payment.id,
+        amount=str(payment.amount),
+    )
     return payment
 
 
@@ -164,6 +183,7 @@ def handle_webhook(db: Session, provider_name: str, raw_body: bytes, signature: 
             # Seen before. Providers retry; this is normal traffic rather
             # than an error, and the caller answers 200 so they stop.
             db.rollback()
+            audit("webhook.duplicate", event_id=event.event_id, event_type=event.event_type)
             return "duplicate"
 
         new_status = EVENT_TO_STATUS.get(event.event_type)
@@ -171,6 +191,12 @@ def handle_webhook(db: Session, provider_name: str, raw_body: bytes, signature: 
             # An event type this shop does not act on. The id is still
             # recorded, so a redelivery is recognised as a duplicate.
             db.commit()
+            audit(
+                "webhook.ignored",
+                event_id=event.event_id,
+                event_type=event.event_type,
+                reason="event type not acted on",
+            )
             return "ignored"
 
         payment = repo.get_by_reference_for_update(db, provider.name, event.reference)
@@ -182,12 +208,29 @@ def handle_webhook(db: Session, provider_name: str, raw_body: bytes, signature: 
             # must not un-pay the order. The commit keeps the event id, so
             # a later redelivery is a duplicate rather than a fresh attempt.
             db.commit()
+            audit(
+                "webhook.ignored",
+                event_id=event.event_id,
+                event_type=event.event_type,
+                payment_id=payment.id,
+                reason=f"cannot go from {payment.status} to {new_status}",
+            )
             return "ignored"
 
+        was = payment.status
         payment.status = new_status
         _apply_to_order(db, payment, new_status)
 
         db.commit()
+        audit(
+            "payment.status_changed",
+            payment_id=payment.id,
+            order_id=payment.order_id,
+            was=was,
+            now=new_status,
+            event_id=event.event_id,
+            event_type=event.event_type,
+        )
         return "applied"
     except OperationalError as exc:
         db.rollback()

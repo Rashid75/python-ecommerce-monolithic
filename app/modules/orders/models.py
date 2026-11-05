@@ -168,7 +168,11 @@ class IdempotencyKey(Base):
     # RESTRICT, like orders.user_id: the key is evidence that this order
     # was already created, and deleting the order while the key survives
     # would make a retry return a dangling id.
-    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="RESTRICT"))
+    #
+    # index=True found in the Step 64 review: PostgreSQL checks a RESTRICT
+    # foreign key by looking for referencing rows, and with no index that
+    # is a full scan of this table on every order deletion.
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="RESTRICT"), index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

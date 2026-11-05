@@ -93,3 +93,12 @@ class InvalidTransitionError(AppError):
     state for what was asked. The message names both statuses, because
     which one it is in is the thing the caller got wrong.
     """
+
+
+class SignatureError(AppError):
+    """A signed request did not match its signature. The router maps this to 400.
+
+    Separate from ValidationError, which is 422 and means a well-formed
+    request broke a business rule. A bad signature is not a business rule:
+    the request is not trusted at all, and 400 says so without saying why.
+    """

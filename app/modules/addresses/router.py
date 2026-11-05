@@ -6,9 +6,8 @@ scoping rather than absence: every query filters on the authenticated
 user, so another customer's id matches nothing.
 """
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, status
 
-from app.core.exceptions import NotFoundError, ValidationError
 from app.db.session import DbSession
 from app.modules.addresses import service
 from app.modules.addresses.schemas import AddressCreate, AddressRead, AddressUpdate
@@ -26,37 +25,23 @@ def list_addresses(user: CurrentUser, db: DbSession) -> list[AddressRead]:
 
 @router.post("", status_code=status.HTTP_201_CREATED, summary="Add an address")
 def create_address(data: AddressCreate, user: CurrentUser, db: DbSession) -> AddressRead:
-    try:
-        return service.create_address(db, user.id, data)
-    except ValidationError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    return service.create_address(db, user.id, data)
 
 
 @router.get("/{address_id}", summary="Get one of my addresses")
 def get_address(address_id: int, user: CurrentUser, db: DbSession) -> AddressRead:
-    try:
-        return service.get_address(db, user.id, address_id)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    return service.get_address(db, user.id, address_id)
 
 
 @router.patch("/{address_id}", summary="Update one of my addresses")
 def update_address(
     address_id: int, data: AddressUpdate, user: CurrentUser, db: DbSession
 ) -> AddressRead:
-    try:
-        return service.update_address(db, user.id, address_id, data)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except ValidationError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    return service.update_address(db, user.id, address_id, data)
 
 
 @router.delete(
     "/{address_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete one of my addresses"
 )
 def delete_address(address_id: int, user: CurrentUser, db: DbSession) -> None:
-    try:
-        service.delete_address(db, user.id, address_id)
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    service.delete_address(db, user.id, address_id)
