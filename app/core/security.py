@@ -33,6 +33,11 @@ def verify_password(password: str, password_hash: str) -> bool:
     return _hasher.verify(password, password_hash)
 
 
+# How much clock difference between machines to tolerate when checking a
+# token's timestamps. See decode_access_token.
+JWT_CLOCK_LEEWAY_SECONDS = 10
+
+
 def create_access_token(user_id: int) -> str:
     """Make a signed token that identifies one user.
 
@@ -68,6 +73,17 @@ def decode_access_token(token: str) -> int:
             # an attacker sets it to "none" and the signature stops being
             # checked at all.
             algorithms=[settings.jwt_algorithm],
+            # Tolerate a small clock difference between the process that
+            # signed the token and this one. PyJWT rejects a token whose
+            # "iat" is in the future, and two machines' clocks are never
+            # exactly equal - measured at ~2 seconds between this host and
+            # its own container, which was enough to make every freshly
+            # minted token fail with a 401 that looked like a bad password.
+            #
+            # 10 seconds is wide enough for ordinary NTP drift and far too
+            # narrow to matter for expiry: a token is valid for 30 minutes,
+            # so this extends its life by 0.5%.
+            leeway=JWT_CLOCK_LEEWAY_SECONDS,
         )
         return int(payload["sub"])
     except (jwt.InvalidTokenError, KeyError, ValueError) as exc:
