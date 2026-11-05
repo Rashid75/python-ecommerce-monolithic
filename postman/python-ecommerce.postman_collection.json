@@ -1,0 +1,648 @@
+{
+  "info": {
+    "name": "Python Ecommerce API",
+    "description": "Every endpoint of the Python Ecommerce API, in the order you would actually call them.\n\n## Getting started\n\n1. Import this collection and `python-ecommerce.postman_environment.json`.\n2. Select the **Python Ecommerce - local** environment.\n3. Run **Auth > Register** then **Auth > Sign in**. The sign-in request saves `access_token` into the environment, and every other request uses it automatically through collection-level bearer auth.\n\n## Variables you will need to fill in\n\n`product_id`, `category_id`, `address_id` and `order_id` are empty to begin with. Create the thing first, then copy its `id` from the response into the environment. They are deliberately not auto-populated: this collection has no scripts, so nothing writes to them for you except the sign-in request.\n\n## Admin-only requests\n\nCreating, updating and deleting products and categories, adjusting stock, and requesting refunds all require `role = admin`. Registration always creates a customer, so promote an account directly in the database:\n\n```sql\nUPDATE users SET role = 'admin' WHERE email = 'you@example.com';\n```\n\nThen sign in again - the role is read from the database on every request, but you need a token for that account.\n\n## A note on the webhook\n\n`Payments > Webhook` will return **400** unless the `X-Signature` header holds an HMAC-SHA256 of the exact request body, keyed with `APP_PAYMENT_WEBHOOK_SECRET`. That is the point of it. There is no script here to compute one, so generate it yourself:\n\n```bash\npython -c \"import hmac,hashlib,sys; print(hmac.new(b'YOUR_SECRET', open(sys.argv[1],'rb').read(), hashlib.sha256).hexdigest())\" body.json\n```\n\nThe body must be byte-identical to what you send, whitespace included.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{access_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "api",
+      "value": "{{base_url}}{{api_prefix}}",
+      "type": "string",
+      "description": "Convenience join of the two environment variables, so each request shows one path."
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "description": "Outside the version prefix on purpose: infrastructure should not have to change when the API version does.",
+      "item": [
+        {
+          "name": "Liveness",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": ["{{base_url}}"],
+              "path": ["health"]
+            },
+            "description": "Is the process running? Does not touch the database, so it stays 200 even when PostgreSQL is unreachable."
+          },
+          "response": []
+        },
+        {
+          "name": "Readiness",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health/ready",
+              "host": ["{{base_url}}"],
+              "path": ["health", "ready"]
+            },
+            "description": "Is the database reachable? This is what the container healthcheck uses, and what Nginx keeps off the public internet - it is a useful signal for a load balancer and a free availability oracle for anyone else."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{user_email}}\",\n  \"password\": \"{{user_password}}\"\n}"
+            },
+            "url": {
+              "raw": "{{api}}/users",
+              "host": ["{{api}}"],
+              "path": ["users"]
+            },
+            "description": "Creates a customer account. Password must be 8-128 characters.\n\nAlways creates a customer - the role is never taken from the request, because a field a client can send is a field an attacker can set.\n\nRate limited to 5 per minute per address."
+          },
+          "response": []
+        },
+        {
+          "name": "Sign in",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Not a test. This stores the token so every other request",
+                  "// in the collection can use it without you copying it by hand.",
+                  "if (pm.response.code === 200) {",
+                  "    pm.environment.set('access_token', pm.response.json().access_token);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{user_email}}\",\n  \"password\": \"{{user_password}}\"\n}"
+            },
+            "url": {
+              "raw": "{{api}}/auth/login",
+              "host": ["{{api}}"],
+              "path": ["auth", "login"]
+            },
+            "description": "Returns a bearer token valid for 30 minutes.\n\nEvery failure - unknown email, wrong password, disabled account - returns the same 401 and the same message, so the response cannot be used to discover who has an account.\n\nRate limited to 10 per minute per address; the 11th gets 429 with Retry-After."
+          },
+          "response": []
+        },
+        {
+          "name": "My account",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/users/me",
+              "host": ["{{api}}"],
+              "path": ["users", "me"]
+            },
+            "description": "The signed-in account. Never includes the password hash."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Catalogue",
+      "description": "Reading is public. Writing requires an admin account.",
+      "item": [
+        {
+          "name": "List products",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/products?limit=20&offset=0",
+              "host": ["{{api}}"],
+              "path": ["products"],
+              "query": [
+                { "key": "limit", "value": "20", "description": "1-100, default 20" },
+                { "key": "offset", "value": "0", "description": "default 0" },
+                { "key": "search", "value": "mug", "disabled": true, "description": "matches name and SKU" },
+                { "key": "is_active", "value": "true", "disabled": true },
+                { "key": "min_price", "value": "5.00", "disabled": true },
+                { "key": "max_price", "value": "50.00", "disabled": true },
+                { "key": "category_id", "value": "{{category_id}}", "disabled": true },
+                { "key": "in_stock", "value": "true", "disabled": true, "description": "only products with stock above zero" },
+                { "key": "sort", "value": "id", "disabled": true, "description": "id | name | price | created_at" },
+                { "key": "order", "value": "asc", "disabled": true, "description": "asc | desc" }
+              ]
+            },
+            "description": "Public. The optional filters are disabled by default - enable the ones you want."
+          },
+          "response": []
+        },
+        {
+          "name": "Get product",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/products/{{product_id}}",
+              "host": ["{{api}}"],
+              "path": ["products", "{{product_id}}"]
+            },
+            "description": "Public. 404 if it does not exist."
+          },
+          "response": []
+        },
+        {
+          "name": "Create product (admin)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sku\": \"MUG-001\",\n  \"name\": \"Blue Mug\",\n  \"description\": \"A mug, in blue.\",\n  \"price\": \"19.99\",\n  \"stock_quantity\": 25,\n  \"is_active\": true\n}"
+            },
+            "url": {
+              "raw": "{{api}}/products",
+              "host": ["{{api}}"],
+              "path": ["products"]
+            },
+            "description": "Admin only. 403 for a customer.\n\n`price` is sent as a string so it survives JSON parsing exactly - a float would introduce rounding before the value ever reaches the database.\n\nSKU uniqueness is case-insensitive: MUG-001 and mug-001 are the same SKU, and the second one gets 409.\n\nCopy the `id` from the response into the `product_id` environment variable."
+            },
+          "response": []
+        },
+        {
+          "name": "Update product (admin)",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"price\": \"24.99\"\n}"
+            },
+            "url": {
+              "raw": "{{api}}/products/{{product_id}}",
+              "host": ["{{api}}"],
+              "path": ["products", "{{product_id}}"]
+            },
+            "description": "Admin only. Send only the fields you want to change.\n\nAny field not in the schema is rejected with 422 rather than ignored - including `stock_quantity`, which has its own endpoint because changing stock is an event, not an edit."
+          },
+          "response": []
+        },
+        {
+          "name": "Adjust stock (admin)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity_change\": 10\n}"
+            },
+            "url": {
+              "raw": "{{api}}/products/{{product_id}}/stock-adjustments",
+              "host": ["{{api}}"],
+              "path": ["products", "{{product_id}}", "stock-adjustments"]
+            },
+            "description": "Admin only. Positive adds stock, negative removes it.\n\nA relative change rather than an absolute value, so two concurrent adjustments both apply instead of one overwriting the other. The row is locked for the duration.\n\nRemoving more than exists returns 409 and changes nothing."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete product (admin)",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/products/{{product_id}}",
+              "host": ["{{api}}"],
+              "path": ["products", "{{product_id}}"]
+            },
+            "description": "Admin only. 204 on success.\n\nRefused with 409 if the product sits in anyone's cart or on any order - a product that has been sold must not vanish from the record. Use `is_active: false` to retire one instead."
+          },
+          "response": []
+        },
+        {
+          "name": "List categories",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/categories?limit=20&offset=0",
+              "host": ["{{api}}"],
+              "path": ["categories"],
+              "query": [
+                { "key": "limit", "value": "20" },
+                { "key": "offset", "value": "0" },
+                { "key": "search", "value": "kitchen", "disabled": true }
+              ]
+            },
+            "description": "Public."
+          },
+          "response": []
+        },
+        {
+          "name": "Get category",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/categories/{{category_id}}",
+              "host": ["{{api}}"],
+              "path": ["categories", "{{category_id}}"]
+            },
+            "description": "Public."
+          },
+          "response": []
+        },
+        {
+          "name": "Create category (admin)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Kitchen\"\n}"
+            },
+            "url": {
+              "raw": "{{api}}/categories",
+              "host": ["{{api}}"],
+              "path": ["categories"]
+            },
+            "description": "Admin only. Names are unique case-insensitively.\n\nCopy the `id` into the `category_id` environment variable."
+          },
+          "response": []
+        },
+        {
+          "name": "Update category (admin)",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Kitchenware\"\n}"
+            },
+            "url": {
+              "raw": "{{api}}/categories/{{category_id}}",
+              "host": ["{{api}}"],
+              "path": ["categories", "{{category_id}}"]
+            },
+            "description": "Admin only."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete category (admin)",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/categories/{{category_id}}",
+              "host": ["{{api}}"],
+              "path": ["categories", "{{category_id}}"]
+            },
+            "description": "Admin only. 409 if any product still points at it - the database refuses rather than silently uncategorising them."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Cart",
+      "description": "No cart id appears in any path. The cart is always the caller's own, taken from the token, so there is no identifier to change to someone else's.",
+      "item": [
+        {
+          "name": "Get my cart",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/cart",
+              "host": ["{{api}}"],
+              "path": ["cart"]
+            },
+            "description": "An empty cart, not a 404: every signed-in customer has one, created on first use.\n\nPrices are read live from the catalogue on every request - the cart stores none - so `total` is today's price. Each line carries `issue` (`unavailable` or `insufficient_stock`) when it cannot currently be bought, and `has_issues` summarises them."
+          },
+          "response": []
+        },
+        {
+          "name": "Add item",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product_id\": {{product_id}},\n  \"quantity\": 2\n}"
+            },
+            "url": {
+              "raw": "{{api}}/cart/items",
+              "host": ["{{api}}"],
+              "path": ["cart", "items"]
+            },
+            "description": "Returns the whole cart, 200 rather than 201: adding the same product again increases the existing line instead of creating a second one, so there is no new URL to point at.\n\nQuantity 1-999. A product that is off sale or short on stock returns 409 - a courtesy check, not a reservation. The check that counts happens inside checkout."
+          },
+          "response": []
+        },
+        {
+          "name": "Set item quantity",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"quantity\": 3\n}"
+            },
+            "url": {
+              "raw": "{{api}}/cart/items/{{product_id}}",
+              "host": ["{{api}}"],
+              "path": ["cart", "items", "{{product_id}}"]
+            },
+            "description": "PUT, not PATCH: the line has one mutable field, so sending the quantity replaces the whole of it. Idempotent - sending it twice leaves the same result.\n\nMinimum 1. Removing an item is a DELETE, not an update to 0."
+          },
+          "response": []
+        },
+        {
+          "name": "Remove item",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/cart/items/{{product_id}}",
+              "host": ["{{api}}"],
+              "path": ["cart", "items", "{{product_id}}"]
+            },
+            "description": "Returns the updated cart rather than 204, because removing a line changes the total and the client needs the new one."
+          },
+          "response": []
+        },
+        {
+          "name": "Empty my cart",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/cart",
+              "host": ["{{api}}"],
+              "path": ["cart"]
+            },
+            "description": "204. The result of emptying a cart is known in advance, so there is nothing worth sending back."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Addresses",
+      "item": [
+        {
+          "name": "List my addresses",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/addresses",
+              "host": ["{{api}}"],
+              "path": ["addresses"]
+            },
+            "description": "Only the caller's own. Scoped in the query, not filtered afterwards."
+          },
+          "response": []
+        },
+        {
+          "name": "Add address",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"label\": \"Home\",\n  \"recipient_name\": \"Rashid Aslam\",\n  \"phone\": \"+973 1700 0000\",\n  \"line1\": \"1 Example Street\",\n  \"line2\": null,\n  \"city\": \"Manama\",\n  \"region\": null,\n  \"postal_code\": null,\n  \"country\": \"BH\",\n  \"is_default\": true\n}"
+            },
+            "url": {
+              "raw": "{{api}}/addresses",
+              "host": ["{{api}}"],
+              "path": ["addresses"]
+            },
+            "description": "`country` is a two-letter code and is uppercased for you. `region` and `postal_code` are optional because not every address across KSA, the UAE and Bahrain uses them.\n\nSetting `is_default: true` clears the flag on your other addresses, in one transaction - exactly one default per customer, enforced by a partial unique index.\n\nMaximum 20 addresses per customer. Copy the `id` into the `address_id` environment variable - checkout needs it."
+          },
+          "response": []
+        },
+        {
+          "name": "Get one address",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/addresses/{{address_id}}",
+              "host": ["{{api}}"],
+              "path": ["addresses", "{{address_id}}"]
+            },
+            "description": "404 for an address belonging to someone else - the same answer as one that does not exist, so the response cannot be used to find out which ids are real."
+          },
+          "response": []
+        },
+        {
+          "name": "Update address",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"line1\": \"99 New Street\",\n  \"city\": \"Riyadh\",\n  \"country\": \"SA\"\n}"
+            },
+            "url": {
+              "raw": "{{api}}/addresses/{{address_id}}",
+              "host": ["{{api}}"],
+              "path": ["addresses", "{{address_id}}"]
+            },
+            "description": "Send only what changes.\n\nEditing an address does NOT change any order already placed to it: an order copies the address at checkout rather than pointing at this row, so it still records where the parcel was actually sent."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete address",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/addresses/{{address_id}}",
+              "host": ["{{api}}"],
+              "path": ["addresses", "{{address_id}}"]
+            },
+            "description": "204. Existing orders keep their copy of it."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Orders",
+      "item": [
+        {
+          "name": "Checkout",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}",
+                "description": "Optional. Send the SAME key when retrying so a double submission returns the first order instead of creating a second. A replay answers 201 with the header Idempotent-Replay: true. {{$guid}} generates a new one per send - replace it with a fixed string to test a retry."
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"address_id\": {{address_id}},\n  \"expected_total\": \"39.98\"\n}"
+            },
+            "url": {
+              "raw": "{{api}}/orders",
+              "host": ["{{api}}"],
+              "path": ["orders"]
+            },
+            "description": "Turns your cart into an order, or changes nothing at all.\n\n`expected_total` must equal the total the server computes from the live prices, or you get **409** with the new total. That is deliberate: it stops a customer being charged an amount they were never shown. Read `total` from `GET /cart` and send it back here.\n\nThe request carries no items, prices or user - all of that is on the server already, and a field a client can send is a field an attacker can set.\n\nOther refusals, none of which change anything: empty cart 409, an address that is not yours 404, a product withdrawn or short on stock 409, heavy lock contention 503.\n\nOn success the order is created as `pending`, stock is taken and the cart is cleared, all in one transaction. Copy the `id` into `order_id`."
+          },
+          "response": []
+        },
+        {
+          "name": "List my orders",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/orders",
+              "host": ["{{api}}"],
+              "path": ["orders"]
+            },
+            "description": "Newest first, the caller's own only. No pagination yet."
+          },
+          "response": []
+        },
+        {
+          "name": "Get one order",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/orders/{{order_id}}",
+              "host": ["{{api}}"],
+              "path": ["orders", "{{order_id}}"]
+            },
+            "description": "Each line carries the SKU, name and unit price **as they were when you bought it**, not as they are now. The shipping address is a copy taken at checkout for the same reason.\n\nSomeone else's order returns 404, not 403."
+          },
+          "response": []
+        },
+        {
+          "name": "Cancel my order",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/orders/{{order_id}}/cancellation",
+              "host": ["{{api}}"],
+              "path": ["orders", "{{order_id}}", "cancellation"]
+            },
+            "description": "POST a cancellation rather than DELETE the order: nothing is deleted, a cancellation is a new fact recorded on an order that goes on existing.\n\nOnly from `pending`, and the stock goes back in the same transaction. A `paid` order returns 409 - money has already moved, so that is a refund, which an admin requests."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Payments",
+      "item": [
+        {
+          "name": "Start a payment",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/orders/{{order_id}}/payments",
+              "host": ["{{api}}"],
+              "path": ["orders", "{{order_id}}", "payments"]
+            },
+            "description": "Creates a **pending** payment and returns what to do next. Nothing here means the order is paid - the shop never decides that. It becomes paid only when a signed webhook says so.\n\nThe sandbox provider moves no money and refuses to run in production.\n\n409 if the order is not `pending`, or already has a successful payment."
+          },
+          "response": []
+        },
+        {
+          "name": "Payment attempts on an order",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/orders/{{order_id}}/payments",
+              "host": ["{{api}}"],
+              "path": ["orders", "{{order_id}}", "payments"]
+            },
+            "description": "Oldest first. Failed attempts stay on record and you can try again; at most one can ever be `succeeded`, which a partial unique index enforces.\n\nThe provider's reference is deliberately not exposed."
+          },
+          "response": []
+        },
+        {
+          "name": "Request a refund (admin)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{api}}/orders/{{order_id}}/refunds",
+              "host": ["{{api}}"],
+              "path": ["orders", "{{order_id}}", "refunds"]
+            },
+            "description": "Admin only. 403 for a customer.\n\nReturns the payment **still marked `succeeded`**. Asking for a refund and being refunded are different facts, and only one of them belongs in a financial record. The payment becomes `refunded`, the order `cancelled` and the stock returns when the provider confirms with a `refund.succeeded` event."
+          },
+          "response": []
+        },
+        {
+          "name": "Webhook",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              {
+                "key": "X-Signature",
+                "value": "{{webhook_signature}}",
+                "description": "HMAC-SHA256 of the exact request body, hex, keyed with APP_PAYMENT_WEBHOOK_SECRET. Compute it yourself - see the collection description - and put it in the environment variable."
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"id\":\"evt_0001\",\"type\":\"payment.succeeded\",\"reference\":\"REPLACE_WITH_PROVIDER_REFERENCE\"}"
+            },
+            "url": {
+              "raw": "{{api}}/webhooks/sandbox",
+              "host": ["{{api}}"],
+              "path": ["webhooks", "sandbox"]
+            },
+            "description": "Called by the payment provider, not by you - included so the flow can be exercised end to end.\n\nNo token. It is trusted only because of the signature over the exact bytes sent, so **do not reformat the body**: changing one space changes the signature.\n\n`type` is one of `payment.succeeded`, `payment.failed`, `refund.succeeded`. Anything else is recorded and ignored. `reference` is the provider's payment reference; read it from the `payments` table, since the API does not expose it.\n\nResponses: 200 `{\"status\":\"applied\"}` when it changed something, `\"duplicate\"` when the event id was seen before, `\"ignored\"` when the move is not legal from the payment's current state - a `failed` arriving after `succeeded` must not un-pay an order. 400 for a bad signature. 404 for an unknown reference."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
