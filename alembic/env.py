@@ -20,7 +20,11 @@ from app.db.base import Base
 from app.modules.addresses.models import Address  # noqa: F401
 from app.modules.cart.models import Cart, CartItem  # noqa: F401
 from app.modules.categories.models import Category  # noqa: F401
-from app.modules.orders.models import Order, OrderItem  # noqa: F401
+from app.modules.orders.models import (  # noqa: F401
+    IdempotencyKey,
+    Order,
+    OrderItem,
+)
 from app.modules.products.models import Product  # noqa: F401
 from app.modules.users.models import User  # noqa: F401
 from sqlalchemy import create_engine, pool

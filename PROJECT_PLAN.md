@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 50 — Clear/update cart only after successful order creation** (Steps 1–49 complete) |
-| **Phases complete** | 8 of 12 |
-| **Steps complete** | 49 of 74 |
+| **Current step** | **Step 53 — Payment abstraction** (Steps 1–52 complete, Phase 9 done) |
+| **Phases complete** | 9 of 12 |
+| **Steps complete** | 52 of 74 |
 
 ### Goals
 
@@ -249,15 +249,15 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | 47 | Checkout and order creation | ✅ |
 | 48 | Validate inventory, atomic stock updates | ✅ |
 | 49 | Order statuses and valid state transitions | ✅ |
-| 50 | Clear/update cart only after successful order creation | 🔵 |
-| 51 | Order history, order details, authorized cancellation | ⬜ |
-| 52 | Explain idempotency, transaction failures, concurrent checkouts | ⬜ |
+| 50 | Clear/update cart only after successful order creation | ✅ |
+| 51 | Order history, order details, authorized cancellation | ✅ |
+| 52 | Explain idempotency, transaction failures, concurrent checkouts | ✅ |
 
 ### Phase 10 — Payments
 
 | # | Step | Status |
 |---|---|---|
-| 53 | Payment abstraction for the chosen provider | ⬜ |
+| 53 | Payment abstraction for the chosen provider | 🔵 |
 | 54 | Integrate payment provider in test/sandbox mode | ⬜ |
 | 55 | Payment status handling | ⬜ |
 | 56 | Validate webhook signatures | ⬜ |
@@ -4986,6 +4986,175 @@ in Phase 10. The rules exist first so that both callers get the same ones.
   transitions are not distinguished; Step 51 must do so.
 - No per-transition timestamps. `updated_at` remembers only the most recent change, so when an
   order was paid cannot be answered after it ships.
+
+### ✅ Step 50 — Clear the Cart Only After the Order Lands
+
+**Completed:** 2026-11-05 · No code change. The behaviour was built into Step 47 and this step
+confirms it.
+
+The roadmap phrases this as *clear the cart only after successful order creation*.
+`cart_repo.clear_items` runs **inside** the checkout transaction, which is strictly stronger: a
+separate clearing transaction would leave a window in which the order exists and the cart still
+does, and a refresh in that window orders twice.
+
+| Case | Result |
+|---|---|
+| a refused checkout | 409, cart keeps all its lines |
+| — stock | unmoved, 100 of 100 |
+| a successful checkout | 201 |
+| — the cart | empty in the same breath |
+| — stock | moved exactly once, 98 of 100 |
+
+6 of 6. Nothing was written for this step; the evidence is what it contributes.
+
+---
+
+### ✅ Step 51 — Order History, Order Details, Authorized Cancellation
+
+**Completed:** 2026-11-05 · No migration. Three endpoints.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /orders` | the caller's own orders, newest first |
+| `GET /orders/{id}` | one of them |
+| `POST /orders/{id}/cancellation` | cancel a pending one and return the stock |
+
+#### Decisions
+
+**Ownership lives in the WHERE clause**, not in an `if` afterwards. `get_for_user` filters on
+`Order.user_id == user_id` alongside the id, so another customer's order never matches and there
+is no moment where the wrong row is in hand and a forgotten check would leak it.
+
+**404, never 403.** An order belonging to someone else is indistinguishable from one that does
+not exist. A 403 confirms the id is real, which is a slow way of listing every order in the shop.
+
+**`POST .../cancellation`, not `DELETE /orders/{id}`.** Nothing is deleted. A cancellation is a
+new fact recorded on an order that goes on existing, which is the whole point of an order being
+a record.
+
+**Only from `pending`.** The state machine permits `paid -> cancelled`, and this path
+deliberately does not use that freedom: a paid order involves money that has already moved, so
+cancelling it is a refund workflow with a provider in it (Step 58), not something a customer
+does by calling an endpoint.
+
+**Returning the stock is in the same transaction as the status change**, so the shelf and the
+order can never disagree. This is the half Step 49 deliberately left out. Products are locked
+through the same sorted `lock_many` as checkout, so a cancellation and a checkout touching the
+same products cannot deadlock.
+
+**No pagination yet.** A customer with thousands of orders would be a problem; Step 64 is where
+that gets measured rather than guessed at.
+
+#### Verification
+
+11 of 11.
+
+| Case | Result |
+|---|---|
+| my orders list | 200, 1 order |
+| another customer's view of it | 0 orders |
+| reading my own order | 200 |
+| another customer reading it | **404**, *Order 236 does not exist* |
+| a nonexistent order | 404, identical message shape |
+| cancelling my pending order | 200, status `cancelled` |
+| — the stock | came back, 100 from 98 |
+| cancelling it twice | 409, *An order that is cancelled cannot be cancelled here* |
+| another customer cancelling it | 404 |
+| cancelling a **paid** order | 409, *An order that is paid cannot be cancelled here* |
+| — its stock | stayed taken |
+
+---
+
+### ✅ Step 52 — Idempotency, Transaction Failures, Concurrent Checkouts
+
+**Completed:** 2026-11-05 · One migration, applied. Closes the item open since Step 44.
+
+#### The problem, stated exactly
+
+A customer who submits checkout twice — a double click, a flaky connection, a client that
+retries on timeout — must end up with one order. Before this step the cart lock serialised the
+two requests and the second found an empty cart, so it got **409 "Your cart is empty"**. That is
+the right number of orders and a terrible answer to *did my order go through?*.
+
+#### The mechanism
+
+An optional `Idempotency-Key` header, and a table whose unique index does the work:
+
+```python
+Index("uq_idempotency_keys_user_id_key", user_id, key, unique=True)
+```
+
+Scoped per customer, so two customers may use the same key and neither can probe the other's.
+The row is written **inside** the checkout transaction, so the key and the order commit together
+— a checkout that failed leaves no key behind, which is what makes retrying a failure safe.
+
+A header rather than a body field: it describes the request attempt, not the order. Two attempts
+at the same order differ in their key while the body stays identical, which is exactly the
+distinction being drawn.
+
+#### A gap found during verification
+
+The key was checked once, before any lock. Ten concurrent duplicate pairs produced
+`(201, 409)` every time: the second request's check ran *before* the first had committed, saw
+nothing, queued on the cart lock, and then found the cart empty — the confusing answer the key
+was added to prevent. Sequential retries worked; simultaneous ones did not.
+
+The fix is a second check **after** the cart lock, where the requests are already serialised:
+
+```python
+cart_repo.lock_cart(db, cart_id)
+if idempotency_key is not None:
+    existing = repo.order_for_key(db, user_id, idempotency_key)
+    if existing is not None:
+        db.rollback()
+        return existing, False
+```
+
+The cheap check before the lock still earns its place: a retry of something that finished long
+ago costs nothing and blocks nobody.
+
+#### Verification
+
+23 of 23 across Steps 50, 51 and 52.
+
+| Case | Result |
+|---|---|
+| first attempt with a key | 201, order created |
+| second attempt, same key | 201, **the same order id** |
+| — the response | carries `Idempotent-Replay: true` |
+| — stock | moved once, not twice |
+| no key at all | 201 then 409 *Your cart is empty* — the old behaviour, retained |
+| **10 simultaneous duplicate pairs** | `(201, 201)` every time, one distinct order id |
+
+The no-key case is kept and tested on purpose. It documents what the header buys rather than
+hiding it.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** Idempotency is the control that stops a retry becoming a
+  second order, and — once Phase 10 exists — a second charge. A double charge is a regulatory
+  and reputational event rather than a bug report, which is why this was required before any
+  payment integration rather than after. Cancellation returning stock in the same transaction
+  means inventory and order records reconcile, with no manual adjustment to explain to an
+  auditor.
+- **Security:** Order reads are scoped in the query and return 404 rather than 403, so sequential
+  order ids cannot be used as an existence oracle — verified from a second customer's token.
+  Cancellation is ownership-checked against the **locked** row, so the status cannot change
+  between the check and the decision. The idempotency key is scoped per user, so one customer's
+  key cannot collide with or reveal another's.
+- **Data residency / cross-border:** Unchanged.
+- **Required controls / approvals:** Idempotency keys are stored indefinitely and never pruned;
+  they are low-sensitivity but unbounded growth, and a retention window should be set.
+  `GET /orders` has no pagination. Operator-initiated transitions (`paid -> shipped`,
+  `shipped -> delivered`) still have no endpoint and no role check — Phase 10 and Step 65.
+- **Residual risk:** **Low** for these paths. The project's standing **Medium** from Step 45 —
+  personal data that deletion will not reach — is unchanged, and `idempotency_keys` now adds a
+  third table holding a reference to it.
+
+#### Open items added
+
+- Idempotency keys are never pruned. Set a retention window.
+- `GET /orders` returns every order with no pagination.
 
 ## 7. Standing Security & Compliance Commitments
 

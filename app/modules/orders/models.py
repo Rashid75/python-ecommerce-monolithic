@@ -137,3 +137,45 @@ class OrderItem(Base):
         # but the cart is not what this table depends on.
         Index("uq_order_items_order_id_product_id", order_id, product_id, unique=True),
     )
+
+
+class IdempotencyKey(Base):
+    """One checkout attempt, remembered so a retry cannot buy twice.
+
+    A customer who submits checkout twice - a double click, a flaky
+    connection, a client that retries on timeout - must end up with one
+    order, not two. The cart lock serialises the two requests, but the
+    second then finds an empty cart and gets a 409, which is a confusing
+    answer to "did my order go through?".
+
+    With a key, the second request gets the first one's order back.
+
+    The row is written inside the checkout transaction, so it commits with
+    the order or not at all. A checkout that failed leaves no key behind,
+    which is what makes retrying a failure safe.
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    # Scoped per customer: two customers may use the same key without
+    # colliding, and one customer cannot probe another's keys.
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+
+    key: Mapped[str] = mapped_column(String(64))
+
+    # RESTRICT, like orders.user_id: the key is evidence that this order
+    # was already created, and deleting the order while the key survives
+    # would make a retry return a dangling id.
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="RESTRICT"))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        # The unique index is the whole mechanism. The second request's
+        # INSERT waits on it while the first transaction is open, then
+        # fails once that commits - so concurrent duplicates are caught by
+        # the database rather than by a check that could race.
+        Index("uq_idempotency_keys_user_id_key", user_id, key, unique=True),
+    )

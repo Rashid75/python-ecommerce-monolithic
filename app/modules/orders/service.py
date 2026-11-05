@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from decimal import Decimal
 
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import (
@@ -121,6 +121,25 @@ assert set(ALLOWED_TRANSITIONS) == set(ORDER_STATUSES), (
 LOCK_TIMEOUT = "5s"
 
 
+def _bound_lock_wait(db: Session) -> None:
+    """Stop this transaction waiting forever for a row lock.
+
+    SET LOCAL applies to this transaction only, so it cannot leak to
+    whatever else borrows this pooled connection next.
+
+    Without it a statement waits for a row lock indefinitely. Checkout
+    holds a cart lock and several product locks at once, so one stuck
+    transaction on a popular product would queue every other customer
+    buying it, each holding a pooled connection until the pool is empty and
+    endpoints with nothing to do with orders start failing. Five seconds is
+    far longer than a healthy checkout needs - twenty of them contending
+    over the same two products measured at tens of milliseconds each - so
+    reaching it means something is wrong, and failing fast is better than
+    queueing.
+    """
+    db.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
+
+
 def _must_be_buyable(product: Product, quantity: int) -> None:
     """Refuse a product that is off sale, or more of it than exists.
 
@@ -141,7 +160,13 @@ def _must_be_buyable(product: Product, quantity: int) -> None:
         )
 
 
-def checkout(db: Session, user_id: int, address_id: int, expected_total: Decimal) -> Order:
+def checkout(
+    db: Session,
+    user_id: int,
+    address_id: int,
+    expected_total: Decimal,
+    idempotency_key: str | None = None,
+) -> tuple[Order, bool]:
     """Turn the caller's cart into an order, or change nothing at all.
 
     The sequence is fixed and the order of its steps is the whole point:
@@ -164,21 +189,20 @@ def checkout(db: Session, user_id: int, address_id: int, expected_total: Decimal
     with no provider call inside the transaction, because a three-second
     payment round trip holding a product's row lock queues every other
     customer buying that product behind it (Step 44).
+
+    Returns the order and whether it was created now. With an
+    idempotency_key, a repeat of a request that already succeeded returns
+    that same order and False, instead of making a second one.
     """
+    if idempotency_key is not None:
+        # Checked before any lock is taken. A retry of something that
+        # already finished should cost nothing and block nobody.
+        existing = repo.order_for_key(db, user_id, idempotency_key)
+        if existing is not None:
+            return existing, False
+
     try:
-        # SET LOCAL applies to this transaction only, so it cannot leak to
-        # whatever else borrows this pooled connection next.
-        #
-        # Without it a statement waits for a row lock forever. Checkout
-        # holds a cart lock and several product locks at once, so one stuck
-        # transaction on a popular product would queue every other customer
-        # buying it, each holding a pooled connection until the pool is
-        # empty and endpoints with nothing to do with orders start failing.
-        # Five seconds is far longer than a healthy checkout needs -
-        # twenty of them contending over the same two products measured at
-        # tens of milliseconds each - so reaching it means something is
-        # wrong, and failing fast is better than queueing.
-        db.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
+        _bound_lock_wait(db)
 
         cart_id = cart_repo.get_cart_id(db, user_id)
         if cart_id is None:
@@ -187,6 +211,18 @@ def checkout(db: Session, user_id: int, address_id: int, expected_total: Decimal
         # Taken before the lines are read. Reading first and locking after
         # is how Step 37's lock ended up protecting nothing.
         cart_repo.lock_cart(db, cart_id)
+
+        if idempotency_key is not None:
+            # Checked again, now that the cart lock has serialised this
+            # request behind any duplicate of it. The check before the lock
+            # ran too early to see a twin that was still in flight: that
+            # one then committed, cleared the cart, and this request would
+            # have reported an empty cart - the confusing answer the key
+            # exists to prevent.
+            existing = repo.order_for_key(db, user_id, idempotency_key)
+            if existing is not None:
+                db.rollback()
+                return existing, False
 
         lines = cart_repo.get_items(db, cart_id)
         if not lines:
@@ -234,8 +270,26 @@ def checkout(db: Session, user_id: int, address_id: int, expected_total: Decimal
         # the cart still does, and a refresh in that window orders twice.
         cart_repo.clear_items(db, cart_id)
 
+        if idempotency_key is not None:
+            # Inside the transaction, so the key and the order commit
+            # together. A checkout that fails leaves no key behind, which
+            # is what makes retrying a failure safe.
+            #
+            # A concurrent duplicate reaches this INSERT while the first
+            # transaction still holds the unique index entry, waits, and
+            # then fails once that commits. The database decides, not a
+            # check that could race.
+            try:
+                repo.claim_idempotency_key(db, user_id, idempotency_key, order.id)
+            except IntegrityError:
+                db.rollback()
+                first = repo.order_for_key(db, user_id, idempotency_key)
+                if first is None:
+                    raise
+                return first, False
+
         db.commit()
-        return order
+        return order, True
     except OperationalError as exc:
         db.rollback()
         # 55P03 is lock_not_available: a row lock was held by someone else
@@ -284,6 +338,73 @@ def change_status(db: Session, order_id: int, new_status: OrderStatus) -> Order:
         order.status = new_status
         db.commit()
         return order
+    except Exception:
+        db.rollback()
+        raise
+
+
+def list_orders(db: Session, user_id: int) -> Sequence[Order]:
+    """Every order this customer placed, newest first."""
+    return repo.list_for_user(db, user_id)
+
+
+def get_order(db: Session, user_id: int, order_id: int) -> Order:
+    """One of this customer's orders.
+
+    An order belonging to someone else raises NotFoundError, the same as
+    one that does not exist. A 403 would confirm that the id is real, which
+    is a slow way of listing every order in the shop.
+    """
+    order = repo.get_for_user(db, user_id, order_id)
+    if order is None:
+        raise NotFoundError(f"Order {order_id} does not exist")
+    return order
+
+
+def cancel_order(db: Session, user_id: int, order_id: int) -> Order:
+    """Cancel one of this customer's own orders and put the stock back.
+
+    Only from 'pending'. A paid order involves money that has already
+    moved, so cancelling it is a refund workflow with a provider in it -
+    Step 58 - and not something a customer can do by calling an endpoint.
+    The state machine allows paid -> cancelled; this path deliberately does
+    not use that freedom.
+
+    Returning the stock is the half that Step 49 left out. It happens in
+    the same transaction as the status change, so the shelf and the order
+    can never disagree: either both happened or neither did.
+    """
+    try:
+        _bound_lock_wait(db)
+
+        # Locked first, and the ownership check comes from the locked row.
+        # Reading it unlocked and then locking would leave a gap in which
+        # the status could change underneath the decision.
+        order = repo.get_by_id_for_update(db, order_id)
+        if order is None or order.user_id != user_id:
+            raise NotFoundError(f"Order {order_id} does not exist")
+
+        if order.status != "pending":
+            raise InvalidTransitionError(
+                f"An order that is {order.status} cannot be cancelled here"
+            )
+
+        # Sorted inside lock_many, as in checkout, so a cancellation and a
+        # checkout touching the same products cannot deadlock.
+        products = product_repo.lock_many(db, (item.product_id for item in order.items))
+        for item in order.items:
+            product = products.get(item.product_id)
+            if product is not None:
+                product.stock_quantity += item.quantity
+
+        order.status = "cancelled"
+        db.commit()
+        return order
+    except OperationalError as exc:
+        db.rollback()
+        if getattr(exc.orig, "sqlstate", None) == "55P03":
+            raise BusyError("The shop is busy right now. Please try again.") from exc
+        raise
     except Exception:
         db.rollback()
         raise
