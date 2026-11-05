@@ -257,7 +257,7 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 
 | # | Step | Status |
 |---|---|---|
-| 53 | Payment abstraction for the chosen provider | 🔵 |
+| 53 | Payment abstraction for the chosen provider | ✅ |
 | 54 | Integrate payment provider in test/sandbox mode | ✅ |
 | 55 | Payment status handling | ✅ |
 | 56 | Validate webhook signatures | ✅ |
