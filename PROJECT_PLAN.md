@@ -143,6 +143,10 @@ python-ecommerce/
 ├── .gitignore                   [done] Step 1
 ├── .python-version              [done] Step 1
 ├── alembic.ini                  Step 9
+├── postman/                     [done] after Step 74
+│   ├── python-ecommerce.postman_collection.json   34 requests, one per endpoint
+│   ├── python-ecommerce.postman_environment.json  10 variables, secrets empty
+│   └── README.md                                  how to run it, admin role, webhook signing
 ├── docker-compose.yml           [done] Step 5
 ├── Dockerfile                   Step 66
 ├── PROJECT_PLAN.md              [done] this file
