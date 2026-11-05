@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 53 — Payment abstraction** (Steps 1–52 complete, Phase 9 done) |
-| **Phases complete** | 9 of 12 |
-| **Steps complete** | 52 of 74 |
+| **Current step** | **Step 59 — Centralized exception handling** (Steps 1–58 complete, Phase 10 done) |
+| **Phases complete** | 10 of 12 |
+| **Steps complete** | 58 of 74 |
 
 ### Goals
 
@@ -258,17 +258,17 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 | # | Step | Status |
 |---|---|---|
 | 53 | Payment abstraction for the chosen provider | 🔵 |
-| 54 | Integrate payment provider in test/sandbox mode | ⬜ |
-| 55 | Payment status handling | ⬜ |
-| 56 | Validate webhook signatures | ⬜ |
-| 57 | Handle duplicate and out-of-order webhook events | ⬜ |
-| 58 | Refund and cancellation workflows | ⬜ |
+| 54 | Integrate payment provider in test/sandbox mode | ✅ |
+| 55 | Payment status handling | ✅ |
+| 56 | Validate webhook signatures | ✅ |
+| 57 | Handle duplicate and out-of-order webhook events | ✅ |
+| 58 | Refund and cancellation workflows | ✅ |
 
 ### Phase 11 — Application Hardening
 
 | # | Step | Status |
 |---|---|---|
-| 59 | Centralized exception handling, consistent error responses | ⬜ |
+| 59 | Centralized exception handling, consistent error responses | 🔵 |
 | 60 | Structured logging and request correlation IDs | ⬜ |
 | 61 | Configuration validation and secret handling review | ⬜ |
 | 62 | CORS and security headers | ⬜ |
@@ -5155,6 +5155,192 @@ hiding it.
 
 - Idempotency keys are never pruned. Set a retention window.
 - `GET /orders` returns every order with no pagination.
+
+### ✅ Steps 53–58 — Payments
+
+**Completed:** 2026-11-05 · One migration, applied. Phase 10 complete.
+
+The rule the whole phase exists to keep: **the shop never decides that a payment succeeded.** It
+records what the provider says, after checking the provider really said it.
+
+---
+
+#### Step 53 — Payment abstraction
+
+`app/modules/payments/provider.py` holds the only code that knows what a payment company's API
+looks like. Three operations, and the names are chosen to avoid lying:
+
+| | |
+|---|---|
+| `create_payment` | returns a `PaymentIntent` — the provider is *ready to be paid*, not paid |
+| `start_refund` | **asks** for a refund and returns a reference |
+| `read_webhook` | checks the signature, then parses |
+
+`PaymentIntent` deliberately carries no status. There is no method anywhere that means "mark
+this paid", because that is never a decision this application makes.
+
+#### Step 54 — Sandbox provider
+
+`SandboxProvider` moves no money and talks to nobody. It exists so that intents, webhooks,
+signatures, duplicates and refunds could be built and tested before a contract with a real
+provider exists.
+
+It **never** marks a payment succeeded by itself. A payment here becomes succeeded exactly as it
+would in production — when a signed webhook says so — which during development means a test
+holding the shared secret. That is why the secret is a real secret and not a constant in the
+file.
+
+Refusing to run in production is enforced in `Settings`, so the application fails at startup
+rather than at the first payment:
+
+```python
+if self.is_production and self.payment_provider == "sandbox":
+    raise ValueError("APP_PAYMENT_PROVIDER must not be 'sandbox' in production")
+```
+
+#### Step 55 — Payment status handling
+
+```
+pending   -> succeeded, failed
+succeeded -> refunded
+failed    -> (terminal)
+refunded  -> (terminal)
+```
+
+Two indexes carry the real guarantees:
+
+```sql
+uq_payments_provider_reference      (provider, reference)
+uq_payments_one_success_per_order   (order_id) WHERE status = 'succeeded'
+```
+
+The partial index is the one that matters. Failed attempts may pile up and be retried; **a
+second successful charge for the same order is a double charge**, and the database refuses it
+rather than trusting the code never to.
+
+A failed payment leaves the order `pending`, so the customer can try again and the failed
+attempt stays on record.
+
+#### Step 56 — Webhook signatures
+
+HMAC-SHA256 over the **raw bytes**, compared with `hmac.compare_digest` — not `==`, because a
+normal comparison returns as soon as two bytes differ, so how long it takes leaks how much of
+the signature was right and a patient attacker guesses one byte at a time.
+
+The body is parsed only *after* the signature passes. Handing unverified bytes to a parser is
+work done on behalf of whoever sent them.
+
+This forced the only `async def` endpoint in the project. FastAPI parsing the JSON into a model
+and re-serialising it to check would change key order and whitespace, so the signature could
+never match. `await request.body()` gives the bytes as sent; the synchronous database work is
+then handed to a worker thread, because calling SQLAlchemy directly inside an async function
+would block the event loop for the whole transaction.
+
+#### Step 57 — Duplicate and out-of-order events
+
+```
+1. check the signature, before parsing anything
+2. record the event id          <- a duplicate fails here
+3. lock the payment row
+4. apply only if the move is legal from where it is now
+5. commit
+```
+
+Step 2 sharing a transaction with step 4 is what makes delivery twice safe. Recorded separately,
+a crash between them would leave an event marked seen but never applied, or applied twice.
+
+Out-of-order events are **ignored, not refused**. Providers retry and reorder; a `failed`
+arriving after `succeeded` is an old delivery, not an error, and the correct response is to
+change nothing and answer 200 so the provider stops retrying. 200 is returned for `applied`,
+`duplicate` and `ignored` alike — anything else makes a provider redeliver an event already
+dealt with.
+
+#### Step 58 — Refunds
+
+`POST /orders/{id}/refunds`, admin only. It asks the provider and **returns the payment still
+marked `succeeded`**. A refund that was requested and a refund that happened are different
+facts, and only one of them belongs in a financial record.
+
+When `refund.succeeded` arrives, the payment becomes `refunded`, the order becomes `cancelled`
+and the stock goes back — all in one transaction, through the same `return_stock` the customer
+cancellation path uses, so the two agree by construction rather than by two similar loops
+staying in step.
+
+---
+
+#### Files added
+
+| File | Contents |
+|---|---|
+| `app/modules/payments/models.py` | `Payment`, `WebhookEvent`, `PaymentStatus` |
+| `app/modules/payments/provider.py` | `PaymentProvider` protocol, `SandboxProvider`, `get_provider` |
+| `app/modules/payments/service.py` | `start_payment`, `start_refund`, `handle_webhook` |
+| `app/modules/payments/repository.py` | queries, including the locking read |
+| `app/modules/payments/schemas.py` | `PaymentRead`, `PaymentStarted` |
+| `app/modules/payments/router.py` | three endpoints plus the webhook |
+| `app/modules/orders/service.py` | `lock_order`, `return_stock` extracted for reuse |
+| `app/core/config.py` | provider, currency, webhook secret, production guard |
+
+#### Verification
+
+40 of 40 over real HTTP.
+
+| Group | Result |
+|---|---|
+| start a payment | 201, `pending`, amount and currency from the order, order still `pending` |
+| the provider reference | **not exposed** in the API response |
+| another customer paying my order | 404 |
+| no signature / wrong signature / wrong secret / body edited after signing | **400 each**, nothing changed |
+| a correctly signed event | `applied`, payment `succeeded`, order `paid` |
+| the same event again | `duplicate`, still one success |
+| a late `payment.failed` | `ignored` — **did not un-pay the order** |
+| an event type we do not act on | `ignored` |
+| an event for an unknown payment | 404 |
+| a failed payment | order stays `pending`, customer retries, retry succeeds |
+| paying an already-paid order | 409 |
+| a customer asking for a refund | **403** |
+| an admin asking | 200, payment **still `succeeded`**, order still `paid`, stock still taken |
+| `refund.succeeded` arrives | payment `refunded`, order `cancelled`, stock back |
+| the same refund event again | `ignored`, stock did not come back twice |
+
+The four signature cases and the late-`failed` case are the ones worth having. They are the
+difference between a webhook endpoint and a public "mark this order paid" button.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** The shop never records money it was not told about. Payment
+  status changes only on a signed provider event, refunds are recorded only when confirmed, and
+  the partial unique index makes a second successful charge per order impossible at the database
+  level. No card data, PAN, CVV or cardholder name touches this system at any point — the
+  provider's own flow handles that — which keeps PCI-DSS scope at its minimum, and that must
+  remain true of any real provider integration.
+- **Security:** `APP_PAYMENT_WEBHOOK_SECRET` is exactly as sensitive as `APP_JWT_SECRET`:
+  anyone holding it can forge an event saying an order was paid. It has no default, for the same
+  reason. Signature comparison is constant-time. A bad signature returns 400 with no detail about
+  why. Refunds require an admin role enforced by a dependency rather than a check inside the
+  handler. The provider reference is kept out of API responses.
+- **Data residency / cross-border:** **This is where the system boundary is crossed.** A real
+  provider receives order amounts and, depending on integration style, customer identifiers, and
+  may process or store them outside KSA, UAE and Bahrain. The cross-border assessment flagged in
+  Step 44 is now concrete and must be completed **before** a real provider replaces the sandbox —
+  including where the provider processes data, what contractual terms cover it, and whether
+  customer consent or a transfer mechanism is required.
+- **Required controls / approvals:** Provider selection needs a due-diligence and residency
+  assessment, not just a technical integration. The webhook endpoint has no rate limiting and no
+  IP allow-list, so it can be flooded by anyone who finds it — the signature check is cheap but
+  not free (Step 63). Webhook events are stored indefinitely. Nothing alerts on a payment stuck
+  `pending`, which is also the pending-order-stock problem from Step 44, still open.
+- **Residual risk:** **Medium**, and the increase is honest: the code paths are demonstrated,
+  but the sandbox provider means no integration has been tested against a real counterparty, and
+  the residency question is identified rather than answered.
+
+#### Open items added
+
+- Cross-border and due-diligence assessment required before a real provider replaces the sandbox.
+- The webhook endpoint is unauthenticated by design and unthrottled; needs rate limiting and
+  ideally an IP allow-list.
+- Nothing alerts on payments stuck in `pending`, which also holds stock indefinitely.
+- Webhook events and idempotency keys are both stored without a retention window.
 
 ## 7. Standing Security & Compliance Commitments
 

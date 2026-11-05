@@ -48,6 +48,20 @@ class Settings(BaseSettings):
     # and nothing here can revoke one early.
     jwt_expire_minutes: int = Field(default=30, ge=1, le=1440)
 
+    # --- Payments ---
+    # Only one option today. A Literal rather than a plain string so a typo
+    # in the environment fails at startup instead of at the first payment.
+    payment_provider: Literal["sandbox"] = "sandbox"
+
+    # ISO 4217, three letters. Stored on every payment rather than assumed,
+    # though products still imply a single currency.
+    payment_currency: str = Field(default="BHD", pattern=r"^[A-Z]{3}$")
+
+    # No default, for the same reason as jwt_secret. Anyone holding this
+    # can forge a webhook saying an order was paid, so it is exactly as
+    # sensitive as the token secret.
+    payment_webhook_secret: SecretStr
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
@@ -67,6 +81,12 @@ class Settings(BaseSettings):
         # Both of these print internal details that clients must never see.
         if self.is_production and (self.debug or self.db_echo):
             raise ValueError("APP_DEBUG and APP_DB_ECHO must be false in production")
+        # The sandbox provider moves no money. Running it in production
+        # would mean orders being marked paid for nothing, so the
+        # application refuses to start rather than discovering this at the
+        # first checkout.
+        if self.is_production and self.payment_provider == "sandbox":
+            raise ValueError("APP_PAYMENT_PROVIDER must not be 'sandbox' in production")
         return self
 
 

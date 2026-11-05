@@ -343,6 +343,32 @@ def change_status(db: Session, order_id: int, new_status: OrderStatus) -> Order:
         raise
 
 
+def lock_order(db: Session, order_id: int) -> Order | None:
+    """Lock one order's row, whoever it belongs to.
+
+    No user_id: this is for callers not acting on behalf of a customer,
+    such as applying a payment event. Ownership checks belong to the paths
+    that have a customer to check against.
+    """
+    return repo.get_by_id_for_update(db, order_id)
+
+
+def return_stock(db: Session, order: Order) -> None:
+    """Put an order's goods back on the shelf. The caller commits.
+
+    Used by customer cancellation and by a confirmed refund, so the two
+    agree by construction rather than by two similar loops staying in step.
+
+    Sorted inside lock_many, as in checkout, so returning stock and selling
+    it cannot deadlock.
+    """
+    products = product_repo.lock_many(db, (item.product_id for item in order.items))
+    for item in order.items:
+        product = products.get(item.product_id)
+        if product is not None:
+            product.stock_quantity += item.quantity
+
+
 def list_orders(db: Session, user_id: int) -> Sequence[Order]:
     """Every order this customer placed, newest first."""
     return repo.list_for_user(db, user_id)
@@ -389,13 +415,7 @@ def cancel_order(db: Session, user_id: int, order_id: int) -> Order:
                 f"An order that is {order.status} cannot be cancelled here"
             )
 
-        # Sorted inside lock_many, as in checkout, so a cancellation and a
-        # checkout touching the same products cannot deadlock.
-        products = product_repo.lock_many(db, (item.product_id for item in order.items))
-        for item in order.items:
-            product = products.get(item.product_id)
-            if product is not None:
-                product.stock_quantity += item.quantity
+        return_stock(db, order)
 
         order.status = "cancelled"
         db.commit()
