@@ -1,0 +1,35 @@
+# Everything that must not reach the build context.
+#
+# A .dockerignore is a security control, not an optimisation. Without it,
+# COPY pulls in .env, .git and the local virtualenv - so the image would
+# carry real secrets and the whole commit history, and `docker history`
+# would show them to anyone who can pull it.
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Version control ---
+.git
+.gitignore
+
+# --- Local environments and caches ---
+.venv
+venv
+__pycache__
+*.py[cod]
+.ruff_cache
+.pytest_cache
+.mypy_cache
+
+# --- Things the image does not need ---
+PROJECT_PLAN.md
+docker-compose.yml
+docker-compose.*.yml
+Dockerfile
+.dockerignore
+.github
+nginx
+*.md
+!README.md

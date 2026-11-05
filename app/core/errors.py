@@ -42,7 +42,7 @@ STATUS_FOR: dict[type[AppError], int] = {
     NotFoundError: status.HTTP_404_NOT_FOUND,
     AuthenticationError: status.HTTP_401_UNAUTHORIZED,
     SignatureError: status.HTTP_400_BAD_REQUEST,
-    ValidationError: status.HTTP_422_UNPROCESSABLE_ENTITY,
+    ValidationError: status.HTTP_422_UNPROCESSABLE_CONTENT,
     # Everything below is 409: the request was well formed and the thing it
     # names exists; it conflicts with the current state of the data.
     AlreadyExistsError: status.HTTP_409_CONFLICT,
@@ -117,7 +117,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         # The per-field errors are kept: they describe the request the
         # client sent, not anything internal.
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": exc.errors(), "code": "request_invalid"},
         )
 

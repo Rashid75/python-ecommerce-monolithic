@@ -49,6 +49,69 @@ services:
       retries: 10
       start_period: 10s
 
+  # Migrations run as their own service, never from the application's
+  # startup. Step 70 explains why at length; the short version is that
+  # every replica would race to migrate, and a failed migration would take
+  # the application down instead of failing a deploy step somebody can stop
+  # and look at.
+  #
+  # Not started by `docker compose up`, because it is in the "migrate"
+  # profile. Run it deliberately:
+  #     docker compose run --rm migrate
+  migrate:
+    build:
+      context: .
+      target: runtime
+    image: python-ecommerce:local
+    profiles: ["migrate"]
+    env_file: .env
+    environment:
+      # The database is a sibling container here, not localhost. Overridden
+      # rather than edited in .env, so the same file works for running the
+      # application on the host too.
+      APP_DB_HOST: db
+      APP_DB_PORT: 5432
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      target: runtime
+    image: python-ecommerce:local
+    container_name: python-ecommerce-api
+    restart: unless-stopped
+    # Everything the application reads, from the one git-ignored file.
+    # Nothing is written into this compose file, so a secret cannot be
+    # committed by editing it.
+    env_file: .env
+    environment:
+      APP_DB_HOST: db
+      APP_DB_PORT: 5432
+    ports:
+      # 127.0.0.1 again: in production Nginx terminates TLS in front of
+      # this (Step 73) and the container port is never published to the
+      # world.
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # Uses the readiness endpoint, which checks the database too, so an
+      # api container that cannot reach PostgreSQL is reported unhealthy
+      # rather than quietly serving 500s.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
 volumes:
   pgdata:
+    # A named volume, so `docker compose down` keeps the data and only
+    # `down -v` destroys it. Database files inside the container's writable
+    # layer would vanish with the container.
     name: python-ecommerce-pgdata

@@ -17,9 +17,9 @@ verified*. It is updated at the end of every completed step.
 |---|---|
 | **Project root** | `D:\python\python-ecommerce` |
 | **Started** | 2026-10-15 |
-| **Current step** | **Step 66 — Production Dockerfile** (Steps 1–65 complete, Phase 11 done) |
-| **Phases complete** | 11 of 12 |
-| **Steps complete** | 65 of 74 |
+| **Current step** | **Complete — all 74 steps, all 12 phases** |
+| **Phases complete** | 12 of 12 |
+| **Steps complete** | 74 of 74 |
 
 ### Goals
 
@@ -280,15 +280,15 @@ Legend: ✅ complete · 🔵 current · ⬜ pending
 
 | # | Step | Status |
 |---|---|---|
-| 66 | Production-oriented Dockerfile | 🔵 |
-| 67 | Finalize Docker Compose for local development | ⬜ |
-| 68 | Environment variables and persistent PostgreSQL storage | ⬜ |
-| 69 | Explain image builds, containers, volumes, networks, startup deps | ⬜ |
-| 70 | Explain running migrations safely during deployment | ⬜ |
-| 71 | GitHub Actions workflow for build and checks | ⬜ |
-| 72 | Deployment options and deployment flow | ⬜ |
-| 73 | Deployment behind Nginx with HTTPS | ⬜ |
-| 74 | Explain secret management, rollback, backups, monitoring | ⬜ |
+| 66 | Production-oriented Dockerfile | ✅ |
+| 67 | Finalize Docker Compose for local development | ✅ |
+| 68 | Environment variables and persistent PostgreSQL storage | ✅ |
+| 69 | Explain image builds, containers, volumes, networks, startup deps | ✅ |
+| 70 | Explain running migrations safely during deployment | ✅ |
+| 71 | GitHub Actions workflow for build and checks | ✅ |
+| 72 | Deployment options and deployment flow | ✅ |
+| 73 | Deployment behind Nginx with HTTPS | ✅ |
+| 74 | Explain secret management, rollback, backups, monitoring | ✅ |
 
 ---
 
@@ -5540,6 +5540,246 @@ refactor: **40/40** payments, **23/23** orders and idempotency, **8/8** state ma
 - Log destination needs a residency assessment.
 - Rate limiting is per process and resets on restart; `X-Forwarded-For` trust unconfigured.
 - Nothing alerts on failed-sign-in or rate-limit rates.
+
+### ✅ Steps 66–74 — Containerization and Deployment
+
+**Completed:** 2026-11-05 · Phase 12 complete. **74 of 74 steps.**
+
+---
+
+#### Step 66 — Production-oriented Dockerfile
+
+Two stages. The builder installs dependencies with build tooling available; the runtime copies
+only `/opt/venv`. Compilers, headers and the uv cache never reach the image that runs in
+production — fewer packages means fewer CVEs to answer for and less to pull on every deploy.
+
+Decisions worth the words:
+
+- **Exact version pins**, `python:3.12.8-slim-bookworm` and `uv:0.5.14`. `3.12-slim` is a moving
+  tag: a deployment that worked yesterday could fail today for reasons no commit explains.
+- **`uv sync --frozen --no-dev`** — install exactly what the lockfile says and fail if it is out
+  of date. A build that silently resolves a different version ships something nobody reviewed.
+- **Dependency files copied before application code**, so the install layer is reused whenever
+  code changes but the lockfile does not. Most deploys change code, not dependencies.
+- **A non-root user**, created before anything is copied, with ownership set during `COPY` rather
+  than a later `chown` that would duplicate every file into a second layer.
+- **No migrations in `CMD`**, and **no `--workers`**. Process count belongs to whatever runs the
+  container and can see how much CPU it was given; hard-coding it is a guess made at build time
+  about a machine that does not exist yet.
+
+`.dockerignore` is a **security control, not an optimisation**. Without it `COPY` pulls in
+`.env`, `.git` and the local virtualenv, so the image carries real secrets and the whole commit
+history — and `docker history` shows them to anyone who can pull it.
+
+Verified: image builds, **323MB**, runs as **uid 1001**, `/srv/app` contains only `alembic`,
+`alembic.ini` and `app` — no `.env`.
+
+#### Step 67 — Compose for local development
+
+`api` and `migrate` services added beside `db`. The API publishes to `127.0.0.1` only, and its
+healthcheck uses `/health/ready`, which checks the database too — so a container that cannot
+reach PostgreSQL is reported unhealthy rather than quietly serving 500s.
+
+Verified against the running stack: `api  Up (healthy)`, `/health/ready` 200, `/api/v1/products`
+200, `/api/v1/orders` 401, and the container's logs are the same JSON lines as everywhere else.
+
+#### Step 68 — Environment variables and persistent storage
+
+Every value comes from `.env`, which is git-ignored, through `env_file`. Nothing is written into
+`docker-compose.yml`, so a secret cannot be committed by editing it. `APP_DB_HOST` is overridden
+per service rather than edited in `.env`, so the same file works for running the application on
+the host.
+
+`pgdata` is a **named volume**: `docker compose down` keeps the data and only `down -v` destroys
+it. Database files in the container's writable layer would vanish with the container.
+
+#### Step 69 — Images, containers, volumes, networks, startup order
+
+- An **image** is a stack of read-only layers; a **container** is one running instance with a thin
+  writable layer on top. Anything written there dies with the container, which is why the
+  database gets a volume.
+- A **volume** is storage Docker manages outside any container's lifetime. The only state in this
+  system that must survive is PostgreSQL's.
+- A **network**: Compose puts both services on one, where `db` resolves to the database
+  container. That is why `APP_DB_HOST=db` inside the container and `127.0.0.1` on the host —
+  same database, two names, depending on which side of the network boundary you are.
+- **Startup order:** `depends_on: condition: service_healthy` waits for PostgreSQL's healthcheck
+  rather than merely for the container to exist. Without the condition, Compose starts the API
+  the moment the database *process* starts, which is seconds before it accepts connections.
+
+#### Step 70 — Running migrations safely during deployment
+
+**Migrations never run from application startup.** Three reasons, each sufficient:
+
+1. **Every replica races.** Four containers starting together means four processes running
+   `alembic upgrade head` at once. Alembic takes a lock, so three wait — but the result is a
+   deploy whose timing depends on who won.
+2. **A failed migration takes the application down.** As a startup step it means no container
+   starts. As a separate step it fails a deploy that can be stopped and looked at, with the old
+   version still serving.
+3. **Rollback becomes impossible to reason about.** If the application and its schema change in
+   one indivisible act, there is no state to return to.
+
+So: `docker compose run --rm migrate`, its own service in a Compose profile so `up` does not
+start it.
+
+The deploy order that follows from this:
+
+```
+1. apply migrations          (backward-compatible ones only)
+2. deploy the new version
+3. verify
+4. apply any destructive migration, later, as its own change
+```
+
+**Backward-compatible means the old code still runs against the new schema**, because during
+step 2 both versions are live at once. Adding a nullable column is safe. Dropping a column,
+renaming one, or adding a `NOT NULL` without a default is not — those are a second deployment
+after the old code is gone.
+
+This project has one live example of the rule: Step 46's trigger makes `order_items` reject
+`UPDATE`. A migration that tried to backfill that table would fail, and it would fail *in the
+migration step*, which is exactly where a surprise should surface.
+
+#### Step 71 — GitHub Actions
+
+`permissions: contents: read` — a pipeline that can deploy is a pipeline whose credentials can
+deploy, and nothing here needs that. The workflow builds and checks; it does not ship.
+
+It runs against **a real PostgreSQL**, not SQLite. The schema uses partial indexes, check
+constraints and `FOR UPDATE`; a green run against a different engine would say nothing about the
+one we deploy on.
+
+| Step | What it catches |
+|---|---|
+| `ruff check` / `ruff format --check` | style and a class of bugs |
+| `alembic upgrade head` | every migration running from an **empty** database — the one path a developer's machine never exercises |
+| `alembic check` | a model changed without a migration |
+| `downgrade -1` then `upgrade head` | a rollback plan nobody has tested |
+| smoke test | import errors and startup-time configuration failures |
+| image build | the Dockerfile, on every change, with no registry credentials |
+| non-root assertion | a silent and serious regression |
+| `.env` absence assertion | a secret reaching the image |
+
+All steps were run locally first: `64 files already formatted`, the downgrade/upgrade round trip
+completes, `alembic check` reports no new operations.
+
+The known gap is recorded rather than glossed: **`alembic check` does not see triggers**, so the
+`order_items` immutability trigger is outside what CI verifies (Step 46).
+
+#### Step 72 — Deployment options and flow
+
+| Option | Trade |
+|---|---|
+| **Single VM, Compose + Nginx** | simplest, cheapest, one machine to lose; fine for a shop this size, and the easiest to reason about for residency because you know exactly where it is |
+| **Managed container platform** | less to operate, provider decides placement — which makes residency a contract question rather than a server-room question |
+| **Kubernetes** | explicitly out of scope for this project, and genuinely unjustified at one service and one database |
+
+Recommended: **single VM with Compose**, managed PostgreSQL if the operational burden of
+backups and patching is not wanted — with the residency of that managed service confirmed before
+it is chosen, not after.
+
+The flow, in order: build and tag an image by commit SHA (never `latest` — you cannot roll back
+to a tag that moves) → push to a registry → run migrations → start the new container → health
+check → shift traffic → keep the previous image.
+
+#### Step 73 — Nginx and HTTPS
+
+`nginx/app.conf` is committed as a template. The certificates it points at never are.
+
+TLS 1.2 and 1.3 only. HSTS set at the proxy *as well as* the application, because Nginx answers
+redirects and error pages that never reach Python. `server_tokens off`. `client_max_body_size
+1m` — nothing this API accepts is close.
+
+`proxy_read_timeout 30s` is deliberately **longer** than the application's 5s `lock_timeout`, so
+a contended checkout returns its own 503 with a usable message rather than being cut off here
+with a 504 that says less.
+
+`/health/ready` is restricted to localhost and private ranges: a useful signal for a load
+balancer and a free availability oracle for anyone else.
+
+**The open item this creates, stated rather than buried:** Nginx sets `X-Forwarded-For`, but the
+application still rate-limits on the peer address — which behind the proxy is Nginx, so every
+caller would share one bucket. Making it honour the header requires `uvicorn --proxy-headers
+--forwarded-allow-ips`, because otherwise any caller could send the header and claim any
+address. **Both halves, or neither.** This must be done when Nginx is actually deployed.
+
+#### Step 74 — Secrets, rollback, backups, monitoring
+
+**Secrets.** `.env` for local only. In production they belong in the platform's secret store
+injected as environment variables, never in an image, a compose file or a repository. Rotation
+has a specific consequence here: rotating `APP_JWT_SECRET` invalidates every live token, and
+rotating `APP_PAYMENT_WEBHOOK_SECRET` must be coordinated with the provider or events start
+failing signature checks. Both are already protected by `SecretStr` and by the startup checks
+from Step 61.
+
+**Rollback.** Redeploy the previous image tag. This works *only* because migrations are separate
+and forward-compatible — a schema change the old code cannot read makes rollback a restore
+instead, which is a different and much worse operation. Destructive migrations go out as their
+own later change for exactly this reason.
+
+**Backups.** `pg_dump` on a schedule, stored off the machine that holds the database, encrypted
+at rest, with the residency of that storage assessed because order and address rows are personal
+data. **A backup that has never been restored is not a backup** — restore drills belong on a
+schedule too. Retention has to satisfy both the commercial/tax retention basis from Step 45 and
+the deletion obligations that still sit open.
+
+**Monitoring.** The JSON logs from Step 60 are the raw material. Worth alerting on, all of which
+exist as events today and none of which are watched: `ratelimit.blocked` rate, `auth.failed`
+rate, 5xx rate, `webhook.ignored` rate, payments stuck in `pending` (which also hold stock), and
+`BusyError`/503 rate as the signal that lock contention is rising.
+
+---
+
+#### Verification
+
+| Case | Result |
+|---|---|
+| image builds | yes, 323MB |
+| runs as non-root | uid 1001 |
+| no `.env` in the image | `/srv/app` holds only `alembic`, `alembic.ini`, `app` |
+| the app imports inside the container | 21 routes |
+| `docker compose run --rm migrate` | migrations applied |
+| `docker compose up -d api` | `Up (healthy)` |
+| `/health/ready` through the container | 200 |
+| `/api/v1/products` | 200 |
+| `/api/v1/orders` unauthenticated | 401 |
+| container logs | JSON, with request ids |
+| `ruff format --check .` | 64 files already formatted |
+| `alembic downgrade -1` then `upgrade head` | both succeed |
+| `alembic check` | no new upgrade operations |
+| compose file | `docker compose config` valid |
+
+One fix along the way: `HTTP_422_UNPROCESSABLE_ENTITY` is deprecated in this Starlette version
+and emitted a warning on every import. Now `HTTP_422_UNPROCESSABLE_CONTENT`.
+
+#### Risk & Controls Note
+
+- **Regulatory / data protection:** Backups and logs are both copies of personal data leaving the
+  database, and both need a residency decision and a retention period. The deploy order protects
+  the integrity of order records during a release: migrations are backward-compatible so the two
+  versions live at once cannot corrupt each other, and destructive changes are separated.
+- **Security:** The image runs as a non-root user, carries no secrets, and is built from pinned
+  bases. CI asserts both of those rather than trusting them. TLS 1.2+, HSTS, restricted readiness
+  endpoint, and edge rate limiting in addition to the application's. CI holds no deployment
+  credentials and `permissions: contents: read`.
+- **Data residency / cross-border:** Three distinct flows now need assessment and none are
+  closed: the payment provider (Phase 10), the log destination (Phase 11), and backup storage
+  (here). Each carries personal or financial data outside the database.
+- **Required controls / approvals:** `X-Forwarded-For` trust must be configured with Nginx or
+  rate limiting counts one address for everyone. Backup restore drills. Alerting on the events
+  listed above. Secret rotation procedure for the two secrets whose rotation has external
+  consequences.
+- **Residual risk:** **Medium** for deployment as designed. The build and container work is
+  demonstrated; the deployment itself is a documented plan that has not been executed, and the
+  three residency assessments remain open.
+
+#### Open items added
+
+- `X-Forwarded-For` trust unconfigured; rate limiting will misattribute behind Nginx.
+- Backup storage, schedule, encryption and **restore drills** not implemented.
+- No alerting on the audit events that exist.
+- Deployment has been designed and not performed; the Nginx config is an untested template.
 
 ## 7. Standing Security & Compliance Commitments
 

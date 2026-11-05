@@ -1,0 +1,143 @@
+# Build and check, on every push and pull request.
+#
+# What this workflow does NOT do is deploy. A pipeline that can deploy is a
+# pipeline whose credentials can deploy, and nothing here needs that.
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# The default token can write to the repository. These jobs only read it.
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push makes an in-flight run for the same branch pointless.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    services:
+      # A real PostgreSQL, not SQLite. The schema uses partial indexes,
+      # check constraints, row locks and FOR UPDATE, none of which behave
+      # the same elsewhere - a green run against a different database would
+      # be telling us nothing about the one we deploy on.
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: ecommerce
+          POSTGRES_PASSWORD: ci-only-password-not-a-secret
+          POSTGRES_DB: ecommerce_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ecommerce -d ecommerce_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      APP_ENVIRONMENT: local
+      APP_DB_HOST: 127.0.0.1
+      APP_DB_PORT: 5432
+      APP_DB_USER: ecommerce
+      APP_DB_NAME: ecommerce_ci
+      # Throwaway values for a throwaway database that exists for the
+      # length of this job. Real secrets live in the deployment
+      # environment, never in a workflow file.
+      APP_DB_PASSWORD: ci-only-password-not-a-secret
+      APP_JWT_SECRET: ci-only-jwt-secret-ci-only-jwt-secret-32
+      APP_PAYMENT_WEBHOOK_SECRET: ci-only-webhook-secret-ci-only-webhook
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned, like every other version in this project. @latest on a
+      # third-party action means someone else chooses what runs with access
+      # to this repository.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.14"
+          enable-cache: true
+
+      - name: Install dependencies
+        # --frozen fails if uv.lock is out of date rather than quietly
+        # resolving something else, so a lockfile nobody updated cannot
+        # slip through review.
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Apply migrations
+        # Proves every migration runs from an empty database, which is the
+        # one path a developer's machine never exercises - theirs has run
+        # them one at a time over weeks.
+        run: uv run alembic upgrade head
+
+      - name: Check models match migrations
+        # Catches a model changed without a migration. Note the known gap
+        # recorded in Step 46: alembic compares tables, columns, indexes
+        # and constraints, and does NOT see triggers or functions, so the
+        # order_items immutability trigger is outside what this checks.
+        run: uv run alembic check
+
+      - name: Check migrations reverse
+        # A downgrade that was never run is a rollback plan nobody has
+        # tested. This runs the newest one both ways.
+        run: |
+          uv run alembic downgrade -1
+          uv run alembic upgrade head
+
+      - name: Smoke test the application
+        # Starts the real application against the real database and asks it
+        # a question. Catches the import errors and startup-time
+        # configuration failures that linting cannot see.
+        run: |
+          uv run uvicorn app.main:app --port 8000 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health/ready > /dev/null; then
+              echo "ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/health/ready
+          curl -fsS http://127.0.0.1:8000/api/v1/products > /dev/null
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/v1/orders)" = "401"
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build only, no push. Proves the Dockerfile works on every change
+      # without this workflow needing registry credentials.
+      - name: Build the image
+        run: docker build -t python-ecommerce:ci .
+
+      - name: Check it runs as a non-root user
+        # A regression here would be silent and serious, so it is asserted
+        # rather than assumed.
+        run: |
+          uid=$(docker run --rm python-ecommerce:ci id -u)
+          test "$uid" != "0" || { echo "image runs as root"; exit 1; }
+          echo "runs as uid $uid"
+
+      - name: Check no secrets were copied in
+        run: |
+          if docker run --rm python-ecommerce:ci sh -c 'ls -a /srv/app' | grep -q '^\.env$'; then
+            echo ".env is inside the image"
+            exit 1
+          fi
+          echo "no .env in the image"
