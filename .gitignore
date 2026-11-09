@@ -38,3 +38,12 @@ desktop.ini
 *.log
 logs/
 postgres-data/
+
+# ---- Frontend ----
+node_modules/
+frontend/dist/
+frontend/.claude/
+*.local
+
+# Exported Postman environments, which may contain a filled-in token
+*.postman_environment.local.json
